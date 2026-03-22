@@ -3,6 +3,7 @@ pub const HEADER_SIZE: usize = 7;
 pub const MAX_UDP: usize = 1400;
 pub const MAX_PAYLOAD: usize = MAX_UDP - HEADER_SIZE; // 1393
 pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8;
+pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameTimingMeta {
@@ -39,6 +40,44 @@ impl FrameTimingMeta {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameParityMeta {
+    pub start_seq: u16,
+    pub total_packets: u16,
+    pub chunk_bytes_sum: u32,
+    pub timing: FrameTimingMeta,
+}
+
+impl FrameParityMeta {
+    pub fn serialize(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= FRAME_PARITY_HEADER_SIZE);
+        buf[0..2].copy_from_slice(&self.start_seq.to_be_bytes());
+        buf[2..4].copy_from_slice(&self.total_packets.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.chunk_bytes_sum.to_be_bytes());
+        buf[8..16].copy_from_slice(&self.timing.capture_ts_micros.to_be_bytes());
+        buf[16..24].copy_from_slice(&self.timing.send_ts_micros.to_be_bytes());
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < FRAME_PARITY_HEADER_SIZE {
+            return None;
+        }
+        Some(Self {
+            start_seq: u16::from_be_bytes([buf[0], buf[1]]),
+            total_packets: u16::from_be_bytes([buf[2], buf[3]]),
+            chunk_bytes_sum: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            timing: FrameTimingMeta {
+                capture_ts_micros: u64::from_be_bytes([
+                    buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+                ]),
+                send_ts_micros: u64::from_be_bytes([
+                    buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+                ]),
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadType {
     /// First packet of a video frame — payload starts with 2-byte total_packets count
@@ -47,6 +86,8 @@ pub enum PayloadType {
     Data = 1,
     /// Single audio packet (raw Opus frame, no reassembly needed)
     Audio = 2,
+    /// Single-parity FEC packet for a video unit.
+    Parity = 8,
     /// Absolute mouse position input from client to server.
     MouseAbsolute = 3,
     /// Relative mouse delta input from client to server.
@@ -65,6 +106,7 @@ impl PayloadType {
             0 => Some(Self::FrameStart),
             1 => Some(Self::Data),
             2 => Some(Self::Audio),
+            8 => Some(Self::Parity),
             3 => Some(Self::MouseAbsolute),
             4 => Some(Self::MouseRelative),
             5 => Some(Self::MouseButtons),
@@ -140,5 +182,21 @@ mod tests {
         let (total_packets, decoded) = FrameTimingMeta::deserialize(&buf).unwrap();
         assert_eq!(total_packets, 7);
         assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn roundtrip_frame_parity_meta() {
+        let meta = FrameParityMeta {
+            start_seq: 91,
+            total_packets: 7,
+            chunk_bytes_sum: 55_000,
+            timing: FrameTimingMeta {
+                capture_ts_micros: 123,
+                send_ts_micros: 456,
+            },
+        };
+        let mut buf = [0u8; FRAME_PARITY_HEADER_SIZE];
+        meta.serialize(&mut buf);
+        assert_eq!(FrameParityMeta::deserialize(&buf).unwrap(), meta);
     }
 }

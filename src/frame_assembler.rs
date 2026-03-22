@@ -1,5 +1,6 @@
 use crate::packet::{
-    FrameTimingMeta, PacketHeader, PayloadType, FRAME_START_HEADER_SIZE, HEADER_SIZE,
+    FrameParityMeta, FrameTimingMeta, PacketHeader, PayloadType, FRAME_PARITY_HEADER_SIZE,
+    FRAME_START_HEADER_SIZE, HEADER_SIZE,
 };
 use std::collections::HashMap;
 
@@ -25,9 +26,12 @@ pub struct IngestOutcome {
 
 struct PartialFrame {
     total_packets: u16,
+    start_seq: Option<u16>,
     received: HashMap<u16, Vec<u8>>,
     payload_bytes: usize,
+    expected_payload_bytes: Option<usize>,
     timing: FrameTimingMeta,
+    parity: Option<Vec<u8>>,
 }
 
 pub struct FrameAssembler {
@@ -70,9 +74,12 @@ impl FrameAssembler {
             .entry(header.frame_id)
             .or_insert_with(|| PartialFrame {
                 total_packets: 0,
+                start_seq: None,
                 received: HashMap::new(),
                 payload_bytes: 0,
+                expected_payload_bytes: None,
                 timing: FrameTimingMeta::default(),
+                parity: None,
             });
 
         match header.payload_type {
@@ -91,24 +98,28 @@ impl FrameAssembler {
                         )
                     };
                 frame.total_packets = total_packets;
+                frame.start_seq = Some(header.seq);
                 frame.timing = timing;
-                let packet = payload[data_offset..].to_vec();
-                if frame.received.capacity() < frame.total_packets as usize {
-                    frame
-                        .received
-                        .reserve(frame.total_packets as usize - frame.received.capacity());
-                }
-                if let Some(old) = frame.received.insert(header.seq, packet) {
-                    frame.payload_bytes = frame.payload_bytes.saturating_sub(old.len());
-                }
-                frame.payload_bytes += payload.len().saturating_sub(data_offset);
+                insert_packet_chunk(frame, header.seq, payload[data_offset..].to_vec());
             }
             PayloadType::Data => {
-                let packet = payload.to_vec();
-                if let Some(old) = frame.received.insert(header.seq, packet) {
-                    frame.payload_bytes = frame.payload_bytes.saturating_sub(old.len());
+                insert_packet_chunk(frame, header.seq, payload.to_vec());
+            }
+            PayloadType::Parity => {
+                let Some(meta) = FrameParityMeta::deserialize(payload) else {
+                    return outcome;
+                };
+                if frame.total_packets == 0 {
+                    frame.total_packets = meta.total_packets;
+                } else if frame.total_packets != meta.total_packets {
+                    return outcome;
                 }
-                frame.payload_bytes += payload.len();
+                frame.start_seq.get_or_insert(meta.start_seq);
+                frame.expected_payload_bytes = Some(meta.chunk_bytes_sum as usize);
+                if frame.timing == FrameTimingMeta::default() {
+                    frame.timing = meta.timing;
+                }
+                frame.parity = Some(payload[FRAME_PARITY_HEADER_SIZE..].to_vec());
             }
             PayloadType::Audio => {
                 // Audio packets are demuxed at the transport layer, not assembled.
@@ -125,17 +136,28 @@ impl FrameAssembler {
             }
         }
 
+        try_recover_single_loss(frame);
+
         // Check completion
         if frame.total_packets > 0 && frame.received.len() == frame.total_packets as usize {
             let Some(partial) = self.pending.remove(&header.frame_id) else {
                 return outcome;
             };
-            // Reassemble in sequence order
-            let mut seqs: Vec<u16> = partial.received.keys().copied().collect();
-            seqs.sort();
             let mut data = Vec::with_capacity(partial.payload_bytes);
-            for seq in seqs {
-                data.extend_from_slice(&partial.received[&seq]);
+            if let Some(start_seq) = partial.start_seq {
+                for offset in 0..partial.total_packets {
+                    let seq = start_seq.wrapping_add(offset);
+                    let Some(chunk) = partial.received.get(&seq) else {
+                        return outcome;
+                    };
+                    data.extend_from_slice(chunk);
+                }
+            } else {
+                let mut seqs: Vec<u16> = partial.received.keys().copied().collect();
+                seqs.sort();
+                for seq in seqs {
+                    data.extend_from_slice(&partial.received[&seq]);
+                }
             }
 
             // Purge any older pending frames
@@ -170,6 +192,72 @@ impl FrameAssembler {
 
         outcome
     }
+}
+
+fn insert_packet_chunk(frame: &mut PartialFrame, seq: u16, packet: Vec<u8>) {
+    if frame.total_packets > 0 && frame.received.capacity() < frame.total_packets as usize {
+        frame
+            .received
+            .reserve(frame.total_packets as usize - frame.received.capacity());
+    }
+    let packet_len = packet.len();
+    if let Some(old) = frame.received.insert(seq, packet) {
+        frame.payload_bytes = frame.payload_bytes.saturating_sub(old.len());
+    }
+    frame.payload_bytes = frame.payload_bytes.saturating_add(packet_len);
+}
+
+fn try_recover_single_loss(frame: &mut PartialFrame) {
+    if frame.total_packets == 0 || frame.received.len() + 1 != frame.total_packets as usize {
+        return;
+    }
+    let Some(start_seq) = frame.start_seq else {
+        return;
+    };
+    let Some(expected_payload_bytes) = frame.expected_payload_bytes else {
+        return;
+    };
+    let Some(parity) = frame.parity.as_ref() else {
+        return;
+    };
+
+    let mut missing_seq = None;
+    for offset in 0..frame.total_packets {
+        let seq = start_seq.wrapping_add(offset);
+        if !frame.received.contains_key(&seq) {
+            if missing_seq.is_some() {
+                return;
+            }
+            missing_seq = Some(seq);
+        }
+    }
+    let Some(missing_seq) = missing_seq else {
+        return;
+    };
+
+    let missing_len = expected_payload_bytes.saturating_sub(frame.payload_bytes);
+    if missing_len == 0 || missing_len > parity.len() {
+        return;
+    }
+
+    let mut recovered = parity.clone();
+    for offset in 0..frame.total_packets {
+        let seq = start_seq.wrapping_add(offset);
+        if seq == missing_seq {
+            continue;
+        }
+        let Some(chunk) = frame.received.get(&seq) else {
+            return;
+        };
+        if chunk.len() > recovered.len() {
+            return;
+        }
+        for (dst, src) in recovered[..chunk.len()].iter_mut().zip(chunk.iter()) {
+            *dst ^= *src;
+        }
+    }
+    recovered.truncate(missing_len);
+    insert_packet_chunk(frame, missing_seq, recovered);
 }
 
 #[cfg(test)]
@@ -260,5 +348,84 @@ mod tests {
         assert_eq!(outcome.feedback.dropped_frames, 1);
         assert!(outcome.feedback.lost_packets >= 1);
         assert_eq!(outcome.completed.unwrap().frame_id, 3);
+    }
+
+    #[test]
+    fn parity_recovers_missing_middle_packet() {
+        let mut slicer = FrameSlicer::new();
+        let mut assembler = FrameAssembler::new();
+
+        let original = vec![0x5A; 8_000];
+        let packets = slicer.slice(&original, 11).to_vec();
+        let parity = slicer.parity_packet().unwrap().to_vec();
+
+        let mut completed = None;
+        for (idx, pkt) in packets.iter().enumerate() {
+            if idx == 1 {
+                continue;
+            }
+            let outcome = assembler.ingest_with_feedback(pkt);
+            if outcome.completed.is_some() {
+                completed = outcome.completed;
+            }
+        }
+        let outcome = assembler.ingest_with_feedback(&parity);
+        completed = completed.or(outcome.completed);
+
+        let result = completed.expect("parity should recover one missing packet");
+        assert_eq!(result.frame_id, 11);
+        assert_eq!(result.data, original);
+    }
+
+    #[test]
+    fn parity_recovers_missing_first_packet() {
+        let mut slicer = FrameSlicer::new();
+        let mut assembler = FrameAssembler::new();
+
+        let original = vec![0x7C; 8_000];
+        let packets = slicer.slice_with_meta(
+            &original,
+            12,
+            FrameTimingMeta {
+                capture_ts_micros: 100,
+                send_ts_micros: 200,
+            },
+        )
+        .to_vec();
+        let parity = slicer.parity_packet().unwrap().to_vec();
+
+        for pkt in packets.iter().skip(1) {
+            assert!(assembler.ingest(pkt).is_none());
+        }
+        let recovered = assembler.ingest(&parity).expect("parity should recover first packet");
+        assert_eq!(recovered.frame_id, 12);
+        assert_eq!(recovered.data, original);
+        assert_eq!(
+            recovered.timing,
+            FrameTimingMeta {
+                capture_ts_micros: 100,
+                send_ts_micros: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn frame_reassembly_preserves_wrapped_sequence_order() {
+        let mut slicer = FrameSlicer::new();
+        slicer.set_seq_for_test(u16::MAX - 1);
+        let mut assembler = FrameAssembler::new();
+
+        let original = vec![0x22; 6_000];
+        let packets = slicer.slice(&original, 13).to_vec();
+        let mut completed = None;
+        for pkt in packets {
+            if let Some(frame) = assembler.ingest(&pkt) {
+                completed = Some(frame);
+            }
+        }
+
+        let result = completed.expect("wrapped frame should complete");
+        assert_eq!(result.frame_id, 13);
+        assert_eq!(result.data, original);
     }
 }
