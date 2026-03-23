@@ -278,6 +278,7 @@ pub struct InputCapabilities {
     pub mouse_relative: bool,
     pub keyboard: bool,
     pub separate_cursor: bool,
+    pub hover_capture: bool,
 }
 
 impl InputCapabilities {
@@ -285,6 +286,7 @@ impl InputCapabilities {
     const MOUSE_RELATIVE_BIT: u8 = 1 << 1;
     const KEYBOARD_BIT: u8 = 1 << 2;
     const SEPARATE_CURSOR_BIT: u8 = 1 << 3;
+    const HOVER_CAPTURE_BIT: u8 = 1 << 4;
 
     fn serialize(&self) -> [u8; INPUT_CAPABILITIES_PAYLOAD_SIZE] {
         let mut flags = 0u8;
@@ -300,6 +302,9 @@ impl InputCapabilities {
         if self.separate_cursor {
             flags |= Self::SEPARATE_CURSOR_BIT;
         }
+        if self.hover_capture {
+            flags |= Self::HOVER_CAPTURE_BIT;
+        }
         [flags]
     }
 
@@ -314,6 +319,7 @@ impl InputCapabilities {
             mouse_relative: flags & Self::MOUSE_RELATIVE_BIT != 0,
             keyboard: flags & Self::KEYBOARD_BIT != 0,
             separate_cursor: flags & Self::SEPARATE_CURSOR_BIT != 0,
+            hover_capture: flags & Self::HOVER_CAPTURE_BIT != 0,
         })
     }
 }
@@ -914,6 +920,7 @@ mod tests {
             mouse_relative: true,
             keyboard: true,
             separate_cursor: false,
+            hover_capture: true,
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
