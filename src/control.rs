@@ -267,6 +267,7 @@ pub struct SessionDebugInfo {
     pub capture_backend: String,
     pub input_backend: String,
     pub target_bitrate_kbps: u32,
+    pub quality_preset: String,
 }
 
 impl SessionDebugInfo {
@@ -274,39 +275,46 @@ impl SessionDebugInfo {
         let encoder = self.encoder_name.as_bytes();
         let capture = self.capture_backend.as_bytes();
         let input = self.input_backend.as_bytes();
+        let quality = self.quality_preset.as_bytes();
         let encoder_len = encoder.len().min(u8::MAX as usize);
         let capture_len = capture.len().min(u8::MAX as usize);
         let input_len = input.len().min(u8::MAX as usize);
-        let mut buf = Vec::with_capacity(7 + encoder_len + capture_len + input_len);
+        let quality_len = quality.len().min(u8::MAX as usize);
+        let mut buf = Vec::with_capacity(8 + encoder_len + capture_len + input_len + quality_len);
         buf.extend_from_slice(&self.target_bitrate_kbps.to_be_bytes());
         buf.push(encoder_len as u8);
         buf.push(capture_len as u8);
         buf.push(input_len as u8);
+        buf.push(quality_len as u8);
         buf.extend_from_slice(&encoder[..encoder_len]);
         buf.extend_from_slice(&capture[..capture_len]);
         buf.extend_from_slice(&input[..input_len]);
+        buf.extend_from_slice(&quality[..quality_len]);
         buf
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 7 {
+        if buf.len() < 8 {
             return None;
         }
         let target_bitrate_kbps = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let encoder_len = buf[4] as usize;
         let capture_len = buf[5] as usize;
         let input_len = buf[6] as usize;
-        if buf.len() != 7 + encoder_len + capture_len + input_len {
+        let quality_len = buf[7] as usize;
+        if buf.len() != 8 + encoder_len + capture_len + input_len + quality_len {
             return None;
         }
-        let encoder_start = 7;
+        let encoder_start = 8;
         let capture_start = encoder_start + encoder_len;
         let input_start = capture_start + capture_len;
+        let quality_start = input_start + input_len;
         Some(Self {
             encoder_name: String::from_utf8_lossy(&buf[encoder_start..capture_start]).to_string(),
             capture_backend: String::from_utf8_lossy(&buf[capture_start..input_start]).to_string(),
-            input_backend: String::from_utf8_lossy(&buf[input_start..]).to_string(),
+            input_backend: String::from_utf8_lossy(&buf[input_start..quality_start]).to_string(),
             target_bitrate_kbps,
+            quality_preset: String::from_utf8_lossy(&buf[quality_start..]).to_string(),
         })
     }
 }
@@ -966,6 +974,7 @@ mod tests {
             capture_backend: "pipewire".to_string(),
             input_backend: "uinput".to_string(),
             target_bitrate_kbps: 50_000,
+            quality_preset: "Balanced".to_string(),
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
