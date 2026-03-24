@@ -94,6 +94,16 @@ impl VideoCodecSupport {
         self.bits |= codec.bit();
     }
 
+    pub fn subtract(self, other: Self) -> Self {
+        Self {
+            bits: self.bits & !other.bits,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+
     fn serialize(self) -> u8 {
         self.bits & Self::KNOWN_BITS
     }
