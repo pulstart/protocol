@@ -10,8 +10,9 @@ pub const CONTROL_HEADER_SIZE: usize = 3;
 
 /// Fixed-size payload for stream configuration.
 const STREAM_CONFIG_PAYLOAD_SIZE: usize = 17;
-/// Fixed-size payload for client display refresh hints plus client UDP receive port.
-const CLIENT_DISPLAY_INFO_PAYLOAD_SIZE: usize = 6;
+/// Fixed-size payload for client display refresh hints, client UDP receive
+/// port, and advertised video codec support.
+const CLIENT_DISPLAY_INFO_PAYLOAD_SIZE: usize = 8;
 /// Fixed-size payload for client clock-sync pings.
 const CLOCK_SYNC_PING_PAYLOAD_SIZE: usize = 8;
 /// Fixed-size payload for server clock-sync pongs.
@@ -35,6 +36,14 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::H264 => 1 << 0,
+            Self::Hevc => 1 << 1,
+            Self::Av1 => 1 << 2,
+        }
+    }
+
     fn to_u8(self) -> u8 {
         match self {
             Self::H264 => 0,
@@ -49,6 +58,49 @@ impl VideoCodec {
             1 => Some(Self::Hevc),
             2 => Some(Self::Av1),
             _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoCodecSupport {
+    bits: u8,
+}
+
+impl VideoCodecSupport {
+    const KNOWN_BITS: u8 = VideoCodec::H264.bit() | VideoCodec::Hevc.bit() | VideoCodec::Av1.bit();
+
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    pub const fn h264_only() -> Self {
+        Self {
+            bits: 1 << 0,
+        }
+    }
+
+    pub const fn all() -> Self {
+        Self {
+            bits: Self::KNOWN_BITS,
+        }
+    }
+
+    pub fn supports(self, codec: VideoCodec) -> bool {
+        self.bits & codec.bit() != 0
+    }
+
+    pub fn insert(&mut self, codec: VideoCodec) {
+        self.bits |= codec.bit();
+    }
+
+    fn serialize(self) -> u8 {
+        self.bits & Self::KNOWN_BITS
+    }
+
+    fn deserialize(bits: u8) -> Self {
+        Self {
+            bits: bits & Self::KNOWN_BITS,
         }
     }
 }
@@ -98,6 +150,8 @@ impl StreamConfig {
 pub struct ClientDisplayInfo {
     pub max_refresh_millihz: u32,
     pub udp_port: u16,
+    pub supported_video_codecs: VideoCodecSupport,
+    pub hardware_video_codecs: VideoCodecSupport,
 }
 
 impl ClientDisplayInfo {
@@ -105,18 +159,31 @@ impl ClientDisplayInfo {
         let mut buf = [0u8; CLIENT_DISPLAY_INFO_PAYLOAD_SIZE];
         buf[0..4].copy_from_slice(&self.max_refresh_millihz.to_be_bytes());
         buf[4..6].copy_from_slice(&self.udp_port.to_be_bytes());
+        buf[6] = self.supported_video_codecs.serialize();
+        buf[7] = self.hardware_video_codecs.serialize();
         buf
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
+        let legacy_supported = VideoCodecSupport::h264_only();
         match buf.len() {
             4 => Some(Self {
                 max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
                 udp_port: 0,
+                supported_video_codecs: legacy_supported,
+                hardware_video_codecs: VideoCodecSupport::empty(),
             }),
             CLIENT_DISPLAY_INFO_PAYLOAD_SIZE => Some(Self {
                 max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
                 udp_port: u16::from_be_bytes([buf[4], buf[5]]),
+                supported_video_codecs: VideoCodecSupport::deserialize(buf[6]),
+                hardware_video_codecs: VideoCodecSupport::deserialize(buf[7]),
+            }),
+            6 => Some(Self {
+                max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                udp_port: u16::from_be_bytes([buf[4], buf[5]]),
+                supported_video_codecs: legacy_supported,
+                hardware_video_codecs: VideoCodecSupport::empty(),
             }),
             _ => None,
         }
@@ -807,6 +874,8 @@ mod tests {
         let msg = ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
             max_refresh_millihz: 143_856,
             udp_port: 45_000,
+            supported_video_codecs: VideoCodecSupport::all(),
+            hardware_video_codecs: VideoCodecSupport::h264_only(),
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
@@ -827,6 +896,29 @@ mod tests {
             ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
                 max_refresh_millihz: 143_856,
                 udp_port: 0,
+                supported_video_codecs: VideoCodecSupport::h264_only(),
+                hardware_video_codecs: VideoCodecSupport::empty(),
+            })
+        );
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn deserialize_legacy_six_byte_client_display_info() {
+        let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 6];
+        buf[0] = ControlMessage::TYPE_CLIENT_DISPLAY_INFO;
+        buf[1..3].copy_from_slice(&(6u16).to_be_bytes());
+        buf[3..7].copy_from_slice(&143_856u32.to_be_bytes());
+        buf[7..9].copy_from_slice(&45_000u16.to_be_bytes());
+
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::ClientDisplayInfo(ClientDisplayInfo {
+                max_refresh_millihz: 143_856,
+                udp_port: 45_000,
+                supported_video_codecs: VideoCodecSupport::h264_only(),
+                hardware_video_codecs: VideoCodecSupport::empty(),
             })
         );
         assert_eq!(consumed, buf.len());

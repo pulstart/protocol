@@ -8,6 +8,7 @@ pub use control::{
     ClientDisplayInfo, ClockSyncPing, ClockSyncPong, ControlMessage, ControllerState, CursorShape,
     CursorState, InputCapabilities, InputSession, SessionDebugInfo, StreamConfig,
     TransportFeedback, VideoCodec,
+    VideoCodecSupport,
 };
 pub use frame_assembler::{CompletedFrame, FrameAssembler};
 pub use frame_slicer::FrameSlicer;
