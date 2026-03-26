@@ -3,6 +3,8 @@ pub mod frame_assembler;
 pub mod frame_slicer;
 pub mod input;
 pub mod packet;
+#[cfg(feature = "tunnel")]
+pub mod tunnel;
 
 pub use control::{
     ClientDisplayInfo, ClockSyncPing, ClockSyncPong, ControlMessage, ControllerState, CursorShape,
