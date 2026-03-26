@@ -332,9 +332,82 @@ pub fn gather_local_candidates(port: u16) -> Vec<String> {
     gather_candidates_with_stun(port, None)
 }
 
+/// Enumerate non-loopback local IP addresses using platform-specific methods.
+fn enumerate_local_ips() -> Vec<std::net::IpAddr> {
+    let mut ips = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        // `hostname -I` lists all non-loopback IPs on Linux.
+        if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
+            for tok in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+                if let Ok(ip) = tok.parse::<std::net::IpAddr>() {
+                    if !ip.is_loopback() && !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // `ifconfig` lists interfaces; parse inet lines.
+        if let Ok(output) = std::process::Command::new("ifconfig").output() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("inet ") {
+                    if let Some(addr_str) = rest.split_whitespace().next() {
+                        if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+                            if !ip.is_loopback() && !ips.contains(&ip) {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                }
+                if let Some(rest) = line.strip_prefix("inet6 ") {
+                    if let Some(addr_str) = rest.split_whitespace().next() {
+                        // Strip zone ID suffix (e.g. "%en0")
+                        let addr_str = addr_str.split('%').next().unwrap_or(addr_str);
+                        if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+                            if !ip.is_loopback() && !ips.contains(&ip) {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Parse `ipconfig` output for IPv4/IPv6 addresses.
+        if let Ok(output) = std::process::Command::new("ipconfig").output() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let line = line.trim();
+                // Lines look like: "IPv4 Address. . . . . . . . . . . : 192.168.1.5"
+                // or "IPv6 Address. . . . . . . . . . . : fe80::..."
+                if let Some(pos) = line.rfind(": ") {
+                    let addr_str = line[pos + 2..].trim();
+                    // Strip IPv6 zone ID suffix (e.g. "%12")
+                    let addr_str = addr_str.split('%').next().unwrap_or(addr_str);
+                    if let Ok(ip) = addr_str.parse::<std::net::IpAddr>() {
+                        if !ip.is_loopback() && !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ips
+}
+
 /// Like `gather_local_candidates`, but also performs STUN discovery on the given socket.
 pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -> Vec<String> {
-    use std::net::{IpAddr, UdpSocket as StdUdp};
+    use std::net::UdpSocket as StdUdp;
 
     let mut candidates = Vec::new();
 
@@ -348,21 +421,11 @@ pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -
         }
     }
 
-    // Enumerate all non-loopback IPs via `hostname -I` (Linux).
-    #[cfg(target_os = "linux")]
-    if let Ok(output) = std::process::Command::new("hostname")
-        .arg("-I")
-        .output()
-    {
-        for tok in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-            if let Ok(ip) = tok.parse::<IpAddr>() {
-                if !ip.is_loopback() {
-                    let c = format!("{ip}:{port}");
-                    if !candidates.contains(&c) {
-                        candidates.push(c);
-                    }
-                }
-            }
+    // Enumerate all non-loopback IPs from local network interfaces.
+    for ip in enumerate_local_ips() {
+        let c = format!("{ip}:{port}");
+        if !candidates.contains(&c) {
+            candidates.push(c);
         }
     }
 
