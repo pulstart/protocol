@@ -5,6 +5,8 @@ pub mod input;
 pub mod packet;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
+#[cfg(feature = "tunnel")]
+pub mod reliable_udp;
 
 pub use control::{
     ClientDisplayInfo, ClockSyncPing, ClockSyncPong, ControlMessage, ControllerState, CursorShape,

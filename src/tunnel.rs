@@ -3,7 +3,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305,
 };
 use rand::rngs::OsRng;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -181,4 +181,201 @@ pub fn hole_punch(
     }
 
     Err("hole punch timed out".into())
+}
+
+// ---------------------------------------------------------------------------
+// STUN public IP discovery
+// ---------------------------------------------------------------------------
+
+/// Discover the public IP:port via a minimal STUN Binding Request.
+///
+/// Sends a single STUN Binding Request to a public STUN server and parses the
+/// XOR-MAPPED-ADDRESS from the response. This reveals the NAT's external mapping
+/// for the given local socket, which is exactly what hole punching needs.
+///
+/// `local_socket` must already be bound. The STUN response is received on the
+/// same socket so the NAT mapping is consistent with subsequent hole-punch probes.
+///
+/// Returns `Some(SocketAddr)` with the public IP:port, or `None` on failure.
+pub fn stun_discover_public_addr(local_socket: &UdpSocket) -> Option<SocketAddr> {
+    // STUN servers to try (Google, Cloudflare).
+    const STUN_SERVERS: &[&str] = &[
+        "stun.l.google.com:19302",
+        "stun.cloudflare.com:3478",
+    ];
+
+    // Build a minimal STUN Binding Request (RFC 5389).
+    // Header: type(2) + length(2) + magic_cookie(4) + transaction_id(12) = 20 bytes.
+    let mut request = [0u8; 20];
+    // Message Type: 0x0001 (Binding Request)
+    request[0] = 0x00;
+    request[1] = 0x01;
+    // Message Length: 0 (no attributes)
+    request[2] = 0x00;
+    request[3] = 0x00;
+    // Magic Cookie: 0x2112A442
+    request[4] = 0x21;
+    request[5] = 0x12;
+    request[6] = 0xA4;
+    request[7] = 0x42;
+    // Transaction ID: 12 random bytes
+    let tx_id: [u8; 12] = rand::random();
+    request[8..20].copy_from_slice(&tx_id);
+
+    let prev_timeout = local_socket.read_timeout().ok().flatten();
+    let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
+
+    for server in STUN_SERVERS {
+        // Resolve STUN server address.
+        let addr: SocketAddr = match server.to_socket_addrs() {
+            Ok(mut addrs) => match addrs.next() {
+                Some(a) => a,
+                None => continue,
+            },
+            Err(_) => continue,
+        };
+
+        // Send request.
+        if local_socket.send_to(&request, addr).is_err() {
+            continue;
+        }
+
+        // Receive response.
+        let mut buf = [0u8; 256];
+        let n = match local_socket.recv_from(&mut buf) {
+            Ok((n, _)) => n,
+            Err(_) => continue,
+        };
+
+        if n < 20 {
+            continue;
+        }
+
+        // Verify it's a Binding Success Response (0x0101) with matching transaction ID.
+        if buf[0] != 0x01 || buf[1] != 0x01 {
+            continue;
+        }
+        if buf[8..20] != tx_id {
+            continue;
+        }
+
+        // Parse attributes looking for XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001).
+        let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        let attr_end = (20 + msg_len).min(n);
+        let mut pos = 20;
+        while pos + 4 <= attr_end {
+            let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+            let attr_start = pos + 4;
+            let attr_data_end = attr_start + attr_len;
+            if attr_data_end > attr_end {
+                break;
+            }
+
+            if attr_type == 0x0020 && attr_len >= 8 {
+                // XOR-MAPPED-ADDRESS
+                let family = buf[attr_start + 1];
+                if family == 0x01 {
+                    // IPv4
+                    let xor_port =
+                        u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
+                    let xor_ip = u32::from_be_bytes([
+                        buf[attr_start + 4],
+                        buf[attr_start + 5],
+                        buf[attr_start + 6],
+                        buf[attr_start + 7],
+                    ]) ^ 0x2112A442;
+                    let ip = std::net::Ipv4Addr::from(xor_ip);
+                    let _ = local_socket.set_read_timeout(prev_timeout);
+                    return Some(SocketAddr::new(std::net::IpAddr::V4(ip), xor_port));
+                }
+            } else if attr_type == 0x0001 && attr_len >= 8 {
+                // MAPPED-ADDRESS (fallback)
+                let family = buf[attr_start + 1];
+                if family == 0x01 {
+                    let port =
+                        u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]);
+                    let ip = std::net::Ipv4Addr::new(
+                        buf[attr_start + 4],
+                        buf[attr_start + 5],
+                        buf[attr_start + 6],
+                        buf[attr_start + 7],
+                    );
+                    let _ = local_socket.set_read_timeout(prev_timeout);
+                    return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+                }
+            }
+
+            // Advance to next attribute (padded to 4-byte boundary).
+            pos = attr_start + ((attr_len + 3) & !3);
+        }
+    }
+
+    let _ = local_socket.set_read_timeout(prev_timeout);
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Candidate gathering (shared by server and client)
+// ---------------------------------------------------------------------------
+
+/// Gather local and public network addresses paired with `port` as NAT candidate strings.
+///
+/// Returns `Vec<String>` in `"ip:port"` format. Used by both the server and client
+/// to advertise candidates to the API signaling server.
+///
+/// If `stun_socket` is provided, performs a STUN binding request to discover the
+/// public IP:port as seen by the NAT, and includes it in the candidates. The STUN
+/// probe uses the same socket that will later be used for hole punching, so the NAT
+/// mapping is consistent.
+pub fn gather_local_candidates(port: u16) -> Vec<String> {
+    gather_candidates_with_stun(port, None)
+}
+
+/// Like `gather_local_candidates`, but also performs STUN discovery on the given socket.
+pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -> Vec<String> {
+    use std::net::{IpAddr, UdpSocket as StdUdp};
+
+    let mut candidates = Vec::new();
+
+    // Default-route local IP via unconnected UDP trick.
+    if let Ok(sock) = StdUdp::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                let c = format!("{}:{port}", local.ip());
+                candidates.push(c);
+            }
+        }
+    }
+
+    // Enumerate all non-loopback IPs via `hostname -I` (Linux).
+    #[cfg(target_os = "linux")]
+    if let Ok(output) = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+    {
+        for tok in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            if let Ok(ip) = tok.parse::<IpAddr>() {
+                if !ip.is_loopback() {
+                    let c = format!("{ip}:{port}");
+                    if !candidates.contains(&c) {
+                        candidates.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    // Discover public IP:port via STUN.
+    if let Some(sock) = stun_socket {
+        if let Some(public_addr) = stun_discover_public_addr(sock) {
+            let c = public_addr.to_string();
+            if !candidates.contains(&c) {
+                eprintln!("[stun] Discovered public address: {c}");
+                candidates.push(c);
+            }
+        }
+    }
+
+    candidates
 }
