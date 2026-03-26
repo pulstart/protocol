@@ -593,6 +593,10 @@ pub enum ControlMessage {
     CursorShape(CursorShape),
     /// Server → client: remote cursor position and visibility.
     CursorState(CursorState),
+    /// Client → server: authentication token.
+    Authenticate(String),
+    /// Server → client: authentication result (true = accepted).
+    AuthResult(bool),
 }
 
 impl ControlMessage {
@@ -615,6 +619,8 @@ impl ControlMessage {
     const TYPE_INPUT_CAPABILITIES: u8 = 16;
     const TYPE_CURSOR_SHAPE: u8 = 17;
     const TYPE_CURSOR_STATE: u8 = 18;
+    const TYPE_AUTHENTICATE: u8 = 19;
+    const TYPE_AUTH_RESULT: u8 = 20;
 
     /// Serialize this message into a byte vector (header + payload).
     pub fn serialize(&self) -> Vec<u8> {
@@ -764,6 +770,23 @@ impl ControlMessage {
                 buf[CONTROL_HEADER_SIZE..].copy_from_slice(&payload);
                 buf
             }
+            ControlMessage::Authenticate(token) => {
+                let payload = token.as_bytes();
+                let len = payload.len().min(MAX_CONTROL_PAYLOAD);
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + len];
+                buf[0] = Self::TYPE_AUTHENTICATE;
+                buf[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+                buf[CONTROL_HEADER_SIZE..CONTROL_HEADER_SIZE + len]
+                    .copy_from_slice(&payload[..len]);
+                buf
+            }
+            ControlMessage::AuthResult(ok) => {
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 1];
+                buf[0] = Self::TYPE_AUTH_RESULT;
+                buf[1..3].copy_from_slice(&1u16.to_be_bytes());
+                buf[CONTROL_HEADER_SIZE] = if *ok { 1 } else { 0 };
+                buf
+            }
         }
     }
 
@@ -831,6 +854,14 @@ impl ControlMessage {
             }
             Self::TYPE_CURSOR_STATE => {
                 ControlMessage::CursorState(CursorState::deserialize(payload)?)
+            }
+            Self::TYPE_AUTHENTICATE => {
+                let text = String::from_utf8_lossy(payload).to_string();
+                ControlMessage::Authenticate(text)
+            }
+            Self::TYPE_AUTH_RESULT => {
+                let ok = payload.first().copied().unwrap_or(0) != 0;
+                ControlMessage::AuthResult(ok)
             }
             _ => return None,
         };
