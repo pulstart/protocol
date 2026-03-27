@@ -13,7 +13,7 @@ pub struct FrameTimingMeta {
 
 impl FrameTimingMeta {
     pub fn serialize(&self, total_packets: u16, buf: &mut [u8]) {
-        debug_assert!(buf.len() >= FRAME_START_HEADER_SIZE);
+        assert!(buf.len() >= FRAME_START_HEADER_SIZE, "FrameTimingMeta::serialize: buffer too small");
         buf[0..2].copy_from_slice(&total_packets.to_be_bytes());
         buf[2..10].copy_from_slice(&self.capture_ts_micros.to_be_bytes());
         buf[10..18].copy_from_slice(&self.send_ts_micros.to_be_bytes());
@@ -50,7 +50,7 @@ pub struct FrameParityMeta {
 
 impl FrameParityMeta {
     pub fn serialize(&self, buf: &mut [u8]) {
-        debug_assert!(buf.len() >= FRAME_PARITY_HEADER_SIZE);
+        assert!(buf.len() >= FRAME_PARITY_HEADER_SIZE, "FrameParityMeta::serialize: buffer too small");
         buf[0..2].copy_from_slice(&self.start_seq.to_be_bytes());
         buf[2..4].copy_from_slice(&self.total_packets.to_be_bytes());
         buf[4..8].copy_from_slice(&self.chunk_bytes_sum.to_be_bytes());
@@ -126,7 +126,7 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     pub fn serialize(&self, buf: &mut [u8]) {
-        debug_assert!(buf.len() >= HEADER_SIZE);
+        assert!(buf.len() >= HEADER_SIZE, "PacketHeader::serialize: buffer too small");
         buf[0..2].copy_from_slice(&self.seq.to_be_bytes());
         buf[2..6].copy_from_slice(&self.frame_id.to_be_bytes());
         buf[6] = self.payload_type as u8;

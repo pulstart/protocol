@@ -93,6 +93,12 @@ impl CryptoContext {
     /// `out` must be at least `plaintext.len() + CRYPTO_OVERHEAD` bytes.
     /// Returns the number of bytes written.
     pub fn encrypt_into(&self, plaintext: &[u8], out: &mut [u8]) -> usize {
+        let required = plaintext.len() + CRYPTO_OVERHEAD;
+        assert!(
+            out.len() >= required,
+            "encrypt_into: buffer too small ({} < {required})",
+            out.len()
+        );
         let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = Self::make_nonce(self.direction, counter);
         out[..12].copy_from_slice(nonce.as_slice());
@@ -146,13 +152,15 @@ pub fn hole_punch(
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
 
-    let probe = crypto.encrypt(b"STPUNCH");
     let deadline = Instant::now() + timeout;
     let mut last_send = Instant::now() - Duration::from_secs(1);
 
     while Instant::now() < deadline {
         // Blast probes to every candidate every 500 ms.
+        // Re-encrypt each round so each probe gets a fresh nonce — avoids
+        // identical ciphertext that middleboxes might deduplicate.
         if last_send.elapsed() >= Duration::from_millis(500) {
+            let probe = crypto.encrypt(b"STPUNCH");
             for addr in partner_candidates {
                 let _ = socket.send_to(&probe, addr);
             }
@@ -164,6 +172,16 @@ pub fn hole_punch(
             Ok((n, src)) => {
                 if let Some(pt) = crypto.decrypt(&buf[..n]) {
                     if pt == b"STPUNCH" || pt == b"STPUNCH_ACK" {
+                        // Validate source is one of the expected partner candidates.
+                        let src_matches = partner_candidates.iter().any(|c| *c == src);
+                        if !src_matches {
+                            // Accept anyway — NAT may rewrite ports — but the
+                            // decryption success already authenticates the peer.
+                            eprintln!(
+                                "[punch] accepted punch from {src} (not in candidate list, \
+                                 but decryption succeeded)"
+                            );
+                        }
                         // Confirm to the other side (send a few for reliability).
                         let ack = crypto.encrypt(b"STPUNCH_ACK");
                         for _ in 0..3 {

@@ -106,17 +106,14 @@ impl ReliableState {
     fn process_ack(&mut self, ack: u32, ack_bits: u32) {
         let now = Instant::now();
         self.send_queue.retain(|msg| {
-            let diff = ack.wrapping_sub(msg.seq);
-            // If diff < MAX_SEND_WINDOW, the message seq is <= ack.
-            let _acked_by_cumulative = diff < MAX_SEND_WINDOW as u32 && msg.seq == ack.wrapping_sub(diff);
             // Check if directly acked (seq == ack).
             let directly_acked = msg.seq == ack;
-            // Check if selectively acked via bitmap.
+            // Check if selectively acked via bitmap (bits represent ack+1, ack+2, ...).
             let selectively_acked = {
                 let offset = msg.seq.wrapping_sub(ack).wrapping_sub(1);
                 offset < 32 && (ack_bits & (1 << offset)) != 0
             };
-            // Check cumulative: seq <= ack (with wrapping).
+            // Check cumulative: seq < ack (with wrapping).
             let cumulative_acked = {
                 let d = ack.wrapping_sub(msg.seq);
                 d > 0 && d < MAX_SEND_WINDOW as u32
@@ -157,11 +154,6 @@ impl ReliableState {
                 }
                 self.recv_next = self.recv_next.wrapping_add(1);
             }
-            self.recv_bitmap >>= if !deliverable.is_empty() && deliverable.len() > 1 {
-                0 // already shifted above
-            } else {
-                0
-            };
         } else {
             let offset = seq.wrapping_sub(self.recv_next);
             if offset == 0 || offset >= MAX_SEND_WINDOW as u32 {
@@ -306,6 +298,12 @@ impl PunchedSocket {
     /// Try to receive the next packet. Returns `None` if the socket would block.
     /// The socket should be set to non-blocking or have a short read timeout.
     pub fn try_recv(&self) -> Option<PunchedMessage> {
+        self.try_recv_all().into_iter().next()
+    }
+
+    /// Try to receive all pending messages from a single UDP read.
+    /// Returns an empty vec if the socket would block.
+    pub fn try_recv_all(&self) -> Vec<PunchedMessage> {
         let mut buf = [0u8; 2048];
         let (n, _src) = match self.socket.recv_from(&mut buf) {
             Ok(r) => r,
@@ -313,24 +311,27 @@ impl PunchedSocket {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return None;
+                return Vec::new();
             }
-            Err(_) => return None,
+            Err(_) => return Vec::new(),
         };
 
-        let plaintext = self.crypto.decrypt(&buf[..n])?;
+        let plaintext = match self.crypto.decrypt(&buf[..n]) {
+            Some(pt) => pt,
+            None => return Vec::new(),
+        };
         if plaintext.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         let channel = plaintext[0];
         match channel {
             CHANNEL_MEDIA => {
-                Some(PunchedMessage::Media(plaintext[1..].to_vec()))
+                vec![PunchedMessage::Media(plaintext[1..].to_vec())]
             }
             CHANNEL_CONTROL => {
                 if plaintext.len() < 1 + RELIABLE_HEADER_SIZE {
-                    return None;
+                    return Vec::new();
                 }
                 let seq = u32::from_be_bytes([
                     plaintext[1], plaintext[2], plaintext[3], plaintext[4],
@@ -351,7 +352,7 @@ impl PunchedSocket {
                 // Record received seq and get deliverable payloads.
                 if payload.is_empty() {
                     // Bare ack or empty control — nothing to deliver.
-                    return None;
+                    return Vec::new();
                 }
                 let delivered = state.record_recv(seq, payload);
                 drop(state);
@@ -359,13 +360,14 @@ impl PunchedSocket {
                 // Send ack back.
                 let _ = self.send_ack();
 
-                // Return the first deliverable message. If there are more,
-                // they will be returned on subsequent calls (they're buffered
-                // in the reliable state's reorder mechanism).
-                // For simplicity, deliver the first one now.
-                delivered.into_iter().next().map(PunchedMessage::Control)
+                // Return all deliverable messages (in-order + any consecutive
+                // buffered packets that became deliverable).
+                delivered
+                    .into_iter()
+                    .map(PunchedMessage::Control)
+                    .collect()
             }
-            _ => None,
+            _ => Vec::new(),
         }
     }
 

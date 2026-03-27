@@ -34,6 +34,9 @@ struct PartialFrame {
     parity: Option<Vec<u8>>,
 }
 
+/// Maximum number of pending incomplete frames before forcing cleanup.
+const MAX_PENDING_FRAMES: usize = 30;
+
 pub struct FrameAssembler {
     pending: HashMap<u32, PartialFrame>,
     last_completed: u32,
@@ -63,10 +66,16 @@ impl FrameAssembler {
         };
         let payload = &raw[HEADER_SIZE..];
 
-        // Discard frames older than what we've already completed
-        if self.has_completed && header.frame_id <= self.last_completed {
-            outcome.feedback.late_packets = 1;
-            return outcome;
+        // Discard frames older than what we've already completed.
+        // Use wrapping arithmetic so frame_id wraparound (u32::MAX → 0) works.
+        if self.has_completed {
+            let age = header.frame_id.wrapping_sub(self.last_completed);
+            // age >= 0x8000_0000 means header.frame_id is behind last_completed
+            // (or equal when age == 0).
+            if age == 0 || age >= 0x8000_0000 {
+                outcome.feedback.late_packets = 1;
+                return outcome;
+            }
         }
 
         let frame = self
@@ -97,9 +106,13 @@ impl FrameAssembler {
                             2,
                         )
                     };
-                frame.total_packets = total_packets;
-                frame.start_seq = Some(header.seq);
-                frame.timing = timing;
+                // Only accept the first FrameStart for a given frame to prevent
+                // metadata overwrites from duplicates or retransmissions.
+                if frame.start_seq.is_none() {
+                    frame.total_packets = total_packets;
+                    frame.start_seq = Some(header.seq);
+                    frame.timing = timing;
+                }
                 insert_packet_chunk(frame, header.seq, payload[data_offset..].to_vec());
             }
             PayloadType::Data => {
@@ -161,18 +174,24 @@ impl FrameAssembler {
             }
 
             // Purge any older pending frames
-            if self.last_completed > 0 && header.frame_id > self.last_completed {
-                outcome.feedback.dropped_frames =
-                    header.frame_id.saturating_sub(self.last_completed + 1);
+            if self.has_completed {
+                let gap = header.frame_id.wrapping_sub(self.last_completed);
+                if gap > 1 && gap < 0x8000_0000 {
+                    outcome.feedback.dropped_frames = gap - 1;
+                }
             }
 
             self.last_completed = header.frame_id;
             self.has_completed = true;
             self.pending.retain(|&fid, frame| {
-                if fid > header.frame_id {
+                // Use wrapping distance to handle u32 frame_id wraparound.
+                let dist = fid.wrapping_sub(header.frame_id);
+                // dist > 0 && dist < 0x8000_0000 means fid is ahead (newer) — keep it.
+                if dist > 0 && dist < 0x8000_0000 {
                     return true;
                 }
-                if fid < header.frame_id && frame.total_packets > 0 {
+                // fid is older or equal — count lost packets and remove.
+                if fid != header.frame_id && frame.total_packets > 0 {
                     outcome.feedback.lost_packets = outcome.feedback.lost_packets.saturating_add(
                         frame
                             .total_packets
@@ -182,6 +201,16 @@ impl FrameAssembler {
                 }
                 false
             });
+
+            // Safety valve: if too many pending frames accumulated (stream stall
+            // or severe loss), purge the oldest to prevent unbounded memory growth.
+            while self.pending.len() > MAX_PENDING_FRAMES {
+                if let Some(&oldest_fid) = self.pending.keys().min() {
+                    self.pending.remove(&oldest_fid);
+                } else {
+                    break;
+                }
+            }
 
             outcome.completed = Some(CompletedFrame {
                 frame_id: header.frame_id,
