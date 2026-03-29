@@ -1,6 +1,8 @@
 use crate::tunnel::CryptoContext;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,86 @@ const MIN_RTO: Duration = Duration::from_millis(50);
 
 /// Maximum RTO ceiling.
 const MAX_RTO: Duration = Duration::from_secs(2);
+const DEFAULT_PUNCHED_UDP_SNDBUF: i32 = 1024 * 1024;
+const DEFAULT_PUNCHED_UDP_RCVBUF: i32 = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const DEFAULT_PUNCHED_UDP_SO_PRIORITY: i32 = 5;
+
+#[cfg(unix)]
+fn set_socket_int_opt(
+    socket: &UdpSocket,
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            optname,
+            &value as *const _ as *const _,
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_socket_int_opt(
+    _socket: &UdpSocket,
+    _level: i32,
+    _optname: i32,
+    _value: i32,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn configure_punched_socket(socket: &UdpSocket, peer: SocketAddr) {
+    let send_buf = std::env::var("ST_UDP_SNDBUF")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PUNCHED_UDP_SNDBUF);
+    let recv_buf = std::env::var("ST_UDP_RCVBUF")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PUNCHED_UDP_RCVBUF);
+    #[cfg(unix)]
+    {
+        let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_SNDBUF, send_buf);
+        let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_RCVBUF, recv_buf);
+
+        if let Some(dscp) = std::env::var("ST_UDP_DSCP")
+            .ok()
+            .and_then(|raw| raw.parse::<u8>().ok())
+            .filter(|value| *value <= 63)
+        {
+            let tos = i32::from(dscp) << 2;
+            let (level, optname) = match peer.ip() {
+                std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+                }
+                _ => (libc::IPPROTO_IP, libc::IP_TOS),
+            };
+            let _ = set_socket_int_opt(socket, level, optname, tos);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let priority = std::env::var("ST_UDP_SO_PRIORITY")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|value| *value >= 0)
+            .unwrap_or(DEFAULT_PUNCHED_UDP_SO_PRIORITY);
+        let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_PRIORITY, priority);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Received message types
@@ -209,6 +291,7 @@ pub struct PunchedSocket {
 impl PunchedSocket {
     /// Create from a hole-punched socket and confirmed peer address.
     pub fn new(socket: UdpSocket, peer: SocketAddr, crypto: Arc<CryptoContext>) -> Self {
+        configure_punched_socket(&socket, peer);
         Self {
             socket,
             peer,
