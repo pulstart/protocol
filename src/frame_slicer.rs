@@ -58,6 +58,26 @@ impl FrameSlicer {
         frame_id: u32,
         timing: FrameTimingMeta,
     ) -> &[Vec<u8>] {
+        self.slice_with_meta_in_place(nal_data, frame_id, timing);
+        &self.packets
+    }
+
+    pub fn slice_with_meta_parts(
+        &mut self,
+        nal_data: &[u8],
+        frame_id: u32,
+        timing: FrameTimingMeta,
+    ) -> (&[Vec<u8>], Option<&[u8]>) {
+        self.slice_with_meta_in_place(nal_data, frame_id, timing);
+        (&self.packets, self.parity_packet())
+    }
+
+    fn slice_with_meta_in_place(
+        &mut self,
+        nal_data: &[u8],
+        frame_id: u32,
+        timing: FrameTimingMeta,
+    ) {
         self.parity_packet.clear();
         self.parity_data.clear();
 
@@ -163,7 +183,6 @@ impl FrameSlicer {
                 .copy_from_slice(&self.parity_data);
         }
 
-        &self.packets
     }
 }
 

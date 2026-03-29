@@ -230,13 +230,13 @@ impl PunchedSocket {
     pub fn send_media(&self, data: &[u8]) -> Result<(), String> {
         let mut buf = self.encrypt_buf.lock().unwrap();
         let plain_len = 1 + data.len();
-        buf.resize(plain_len, 0);
-        buf[0] = CHANNEL_MEDIA;
-        buf[1..plain_len].copy_from_slice(data);
-
-        let encrypted = self.crypto.encrypt(&buf[..plain_len]);
+        let packet_len = plain_len + crate::tunnel::CRYPTO_OVERHEAD;
+        buf.resize(packet_len, 0);
+        buf[12] = CHANNEL_MEDIA;
+        buf[13..13 + data.len()].copy_from_slice(data);
+        let encrypted_len = self.crypto.encrypt_staged_in_place(&mut buf[..packet_len], plain_len);
         self.socket
-            .send_to(&encrypted, self.peer)
+            .send_to(&buf[..encrypted_len], self.peer)
             .map_err(|e| format!("send_media: {e}"))?;
         Ok(())
     }
@@ -316,7 +316,7 @@ impl PunchedSocket {
             Err(_) => return Vec::new(),
         };
 
-        let plaintext = match self.crypto.decrypt(&buf[..n]) {
+        let plaintext = match self.crypto.decrypt_in_place(&mut buf[..n]) {
             Some(pt) => pt,
             None => return Vec::new(),
         };

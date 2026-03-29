@@ -1,5 +1,5 @@
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
     ChaCha20Poly1305,
 };
 use rand::rngs::OsRng;
@@ -102,23 +102,67 @@ impl CryptoContext {
         let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
         let nonce = Self::make_nonce(self.direction, counter);
         out[..12].copy_from_slice(nonce.as_slice());
-        let ct = self
+        let payload_end = 12 + plaintext.len();
+        out[12..payload_end].copy_from_slice(plaintext);
+        let tag = self
             .cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt_in_place_detached(&nonce, b"", &mut out[12..payload_end])
             .expect("ChaCha20-Poly1305 encrypt cannot fail for valid key");
-        let total = 12 + ct.len();
-        out[12..total].copy_from_slice(&ct);
-        total
+        out[payload_end..required].copy_from_slice(tag.as_slice());
+        required
+    }
+
+    /// Encrypt plaintext that has already been staged into `buf[12..12+plaintext_len]`.
+    /// This avoids an extra copy when callers already own a reusable packet buffer.
+    pub fn encrypt_staged_in_place(&self, buf: &mut [u8], plaintext_len: usize) -> usize {
+        let required = plaintext_len + CRYPTO_OVERHEAD;
+        assert!(
+            buf.len() >= required,
+            "encrypt_staged_in_place: buffer too small ({} < {required})",
+            buf.len()
+        );
+        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let nonce = Self::make_nonce(self.direction, counter);
+        buf[..12].copy_from_slice(nonce.as_slice());
+        let payload_end = 12 + plaintext_len;
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut buf[12..payload_end])
+            .expect("ChaCha20-Poly1305 encrypt cannot fail for valid key");
+        buf[payload_end..required].copy_from_slice(tag.as_slice());
+        required
     }
 
     /// Decrypt `[nonce:12][ciphertext+tag]` → plaintext.
     /// Returns `None` on authentication failure or truncated input.
     pub fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
-        if data.len() < 12 + 16 {
+        if data.len() < CRYPTO_OVERHEAD {
             return None;
         }
         let nonce = chacha20poly1305::Nonce::from_slice(&data[..12]);
-        self.cipher.decrypt(nonce, &data[12..]).ok()
+        let payload_end = data.len() - 16;
+        let mut plaintext = data[12..payload_end].to_vec();
+        let tag = chacha20poly1305::Tag::from_slice(&data[payload_end..]);
+        self.cipher
+            .decrypt_in_place_detached(nonce, b"", &mut plaintext, tag)
+            .ok()?;
+        Some(plaintext)
+    }
+
+    /// Decrypt a packet in-place and return the plaintext slice backed by the
+    /// caller-provided buffer.
+    pub fn decrypt_in_place<'a>(&self, data: &'a mut [u8]) -> Option<&'a [u8]> {
+        if data.len() < CRYPTO_OVERHEAD {
+            return None;
+        }
+        let (nonce_bytes, rest) = data.split_at_mut(12);
+        let nonce = chacha20poly1305::Nonce::from_slice(nonce_bytes);
+        let (plaintext, tag_bytes) = rest.split_at_mut(rest.len() - 16);
+        let tag = chacha20poly1305::Tag::clone_from_slice(tag_bytes);
+        self.cipher
+            .decrypt_in_place_detached(nonce, b"", plaintext, &tag)
+            .ok()?;
+        Some(plaintext)
     }
 }
 
