@@ -2,8 +2,35 @@
 pub const HEADER_SIZE: usize = 7;
 pub const MAX_UDP: usize = 1400;
 pub const MAX_PAYLOAD: usize = MAX_UDP - HEADER_SIZE; // 1393
+pub const AUDIO_REDUNDANCY_HEADER_SIZE: usize = 2;
 pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8;
 pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioRedundancyMeta {
+    pub redundant_len: u16,
+}
+
+impl AudioRedundancyMeta {
+    pub fn serialize(&self, buf: &mut [u8]) {
+        assert!(
+            buf.len() >= AUDIO_REDUNDANCY_HEADER_SIZE,
+            "AudioRedundancyMeta::serialize: buffer too small"
+        );
+        buf[0..2].copy_from_slice(&self.redundant_len.to_be_bytes());
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < AUDIO_REDUNDANCY_HEADER_SIZE {
+            return None;
+        }
+        let redundant_len = u16::from_be_bytes([buf[0], buf[1]]);
+        if redundant_len as usize > buf.len().saturating_sub(AUDIO_REDUNDANCY_HEADER_SIZE) {
+            return None;
+        }
+        Some(Self { redundant_len })
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameTimingMeta {
@@ -84,7 +111,7 @@ pub enum PayloadType {
     FrameStart = 0,
     /// Continuation packet of a video frame
     Data = 1,
-    /// Single audio packet (raw Opus frame, no reassembly needed)
+    /// Single audio packet: current Opus payload plus optional previous-packet redundancy.
     Audio = 2,
     /// Single-parity FEC packet for a video unit.
     Parity = 8,
@@ -198,5 +225,19 @@ mod tests {
         let mut buf = [0u8; FRAME_PARITY_HEADER_SIZE];
         meta.serialize(&mut buf);
         assert_eq!(FrameParityMeta::deserialize(&buf).unwrap(), meta);
+    }
+
+    #[test]
+    fn roundtrip_audio_redundancy_meta() {
+        let meta = AudioRedundancyMeta { redundant_len: 0 };
+        let mut buf = [0u8; AUDIO_REDUNDANCY_HEADER_SIZE];
+        meta.serialize(&mut buf);
+        assert_eq!(AudioRedundancyMeta::deserialize(&buf).unwrap(), meta);
+    }
+
+    #[test]
+    fn rejects_invalid_audio_redundancy_meta() {
+        let buf = [0x01, 0x00, 0xAA];
+        assert!(AudioRedundancyMeta::deserialize(&buf).is_none());
     }
 }
