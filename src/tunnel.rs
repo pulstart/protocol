@@ -35,7 +35,7 @@ impl TunnelKeys {
 
     /// Compute the shared secret from the partner's public key.
     /// The resulting 32 bytes are used directly as the ChaCha20-Poly1305 key.
-    pub fn derive_shared_key(self, peer_public_bytes: &[u8; 32]) -> [u8; 32] {
+    pub fn derive_shared_key(&self, peer_public_bytes: &[u8; 32]) -> [u8; 32] {
         let peer = PublicKey::from(*peer_public_bytes);
         self.secret.diffie_hellman(&peer).to_bytes()
     }
