@@ -73,18 +73,18 @@ fn set_socket_int_opt(
 }
 
 fn configure_punched_socket(socket: &UdpSocket, peer: SocketAddr) {
-    let send_buf = std::env::var("ST_UDP_SNDBUF")
-        .ok()
-        .and_then(|raw| raw.parse::<i32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PUNCHED_UDP_SNDBUF);
-    let recv_buf = std::env::var("ST_UDP_RCVBUF")
-        .ok()
-        .and_then(|raw| raw.parse::<i32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PUNCHED_UDP_RCVBUF);
     #[cfg(unix)]
     {
+        let send_buf = std::env::var("ST_UDP_SNDBUF")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_PUNCHED_UDP_SNDBUF);
+        let recv_buf = std::env::var("ST_UDP_RCVBUF")
+            .ok()
+            .and_then(|raw| raw.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_PUNCHED_UDP_RCVBUF);
         let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_SNDBUF, send_buf);
         let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_RCVBUF, recv_buf);
 
@@ -113,6 +113,9 @@ fn configure_punched_socket(socket: &UdpSocket, peer: SocketAddr) {
             .unwrap_or(DEFAULT_PUNCHED_UDP_SO_PRIORITY);
         let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_PRIORITY, priority);
     }
+
+    #[cfg(not(unix))]
+    let _ = (socket, peer);
 }
 
 // ---------------------------------------------------------------------------
