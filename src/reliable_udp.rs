@@ -34,7 +34,9 @@ const MIN_RTO: Duration = Duration::from_millis(50);
 
 /// Maximum RTO ceiling.
 const MAX_RTO: Duration = Duration::from_secs(2);
+#[cfg(unix)]
 const DEFAULT_PUNCHED_UDP_SNDBUF: i32 = 1024 * 1024;
+#[cfg(unix)]
 const DEFAULT_PUNCHED_UDP_RCVBUF: i32 = 4 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const DEFAULT_PUNCHED_UDP_SO_PRIORITY: i32 = 5;
@@ -60,16 +62,6 @@ fn set_socket_int_opt(
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-#[cfg(not(unix))]
-fn set_socket_int_opt(
-    _socket: &UdpSocket,
-    _level: i32,
-    _optname: i32,
-    _value: i32,
-) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn configure_punched_socket(socket: &UdpSocket, peer: SocketAddr) {
