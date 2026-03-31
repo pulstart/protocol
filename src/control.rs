@@ -638,6 +638,38 @@ pub enum ControlMessage {
     Authenticate(String),
     /// Server → client: authentication result (true = accepted).
     AuthResult(bool),
+    /// Bidirectional: sender offers a file transfer.
+    FileOffer {
+        transfer_id: u32,
+        file_size: u64,
+        file_name: String,
+    },
+    /// Bidirectional: receiver accepts or rejects a file offer.
+    FileAccept {
+        transfer_id: u32,
+        accepted: bool,
+    },
+    /// Bidirectional: one chunk of file data.
+    FileChunk {
+        transfer_id: u32,
+        chunk_index: u32,
+        data: Vec<u8>,
+    },
+    /// Bidirectional: sender signals all chunks sent + integrity hash.
+    FileComplete {
+        transfer_id: u32,
+        total_chunks: u32,
+        sha256: [u8; 32],
+    },
+    /// Bidirectional: either side cancels an active transfer.
+    FileCancel {
+        transfer_id: u32,
+    },
+    /// Bidirectional: receiver acknowledges progress for flow control.
+    FileProgress {
+        transfer_id: u32,
+        chunks_received: u32,
+    },
 }
 
 impl ControlMessage {
@@ -663,6 +695,12 @@ impl ControlMessage {
     const TYPE_CLIPBOARD_TEXT: u8 = 19;
     const TYPE_AUTHENTICATE: u8 = 20;
     const TYPE_AUTH_RESULT: u8 = 21;
+    const TYPE_FILE_OFFER: u8 = 22;
+    const TYPE_FILE_ACCEPT: u8 = 23;
+    const TYPE_FILE_CHUNK: u8 = 24;
+    const TYPE_FILE_COMPLETE: u8 = 25;
+    const TYPE_FILE_CANCEL: u8 = 26;
+    const TYPE_FILE_PROGRESS: u8 = 27;
 
     /// Serialize this message into a byte vector (header + payload).
     pub fn serialize(&self) -> Vec<u8> {
@@ -839,6 +877,86 @@ impl ControlMessage {
                 buf[CONTROL_HEADER_SIZE] = if *ok { 1 } else { 0 };
                 buf
             }
+            ControlMessage::FileOffer {
+                transfer_id,
+                file_size,
+                file_name,
+            } => {
+                let name_bytes = file_name.as_bytes();
+                let name_len = name_bytes.len().min(MAX_CONTROL_PAYLOAD - 14);
+                let payload_len = 4 + 8 + 2 + name_len;
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + payload_len];
+                buf[0] = Self::TYPE_FILE_OFFER;
+                buf[1..3].copy_from_slice(&(payload_len as u16).to_be_bytes());
+                let p = CONTROL_HEADER_SIZE;
+                buf[p..p + 4].copy_from_slice(&transfer_id.to_be_bytes());
+                buf[p + 4..p + 12].copy_from_slice(&file_size.to_be_bytes());
+                buf[p + 12..p + 14].copy_from_slice(&(name_len as u16).to_be_bytes());
+                buf[p + 14..p + 14 + name_len].copy_from_slice(&name_bytes[..name_len]);
+                buf
+            }
+            ControlMessage::FileAccept {
+                transfer_id,
+                accepted,
+            } => {
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 5];
+                buf[0] = Self::TYPE_FILE_ACCEPT;
+                buf[1..3].copy_from_slice(&5u16.to_be_bytes());
+                let p = CONTROL_HEADER_SIZE;
+                buf[p..p + 4].copy_from_slice(&transfer_id.to_be_bytes());
+                buf[p + 4] = if *accepted { 1 } else { 0 };
+                buf
+            }
+            ControlMessage::FileChunk {
+                transfer_id,
+                chunk_index,
+                data,
+            } => {
+                let data_len = data.len().min(MAX_CONTROL_PAYLOAD - 8);
+                let payload_len = 8 + data_len;
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + payload_len];
+                buf[0] = Self::TYPE_FILE_CHUNK;
+                buf[1..3].copy_from_slice(&(payload_len as u16).to_be_bytes());
+                let p = CONTROL_HEADER_SIZE;
+                buf[p..p + 4].copy_from_slice(&transfer_id.to_be_bytes());
+                buf[p + 4..p + 8].copy_from_slice(&chunk_index.to_be_bytes());
+                buf[p + 8..p + 8 + data_len].copy_from_slice(&data[..data_len]);
+                buf
+            }
+            ControlMessage::FileComplete {
+                transfer_id,
+                total_chunks,
+                sha256,
+            } => {
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 40];
+                buf[0] = Self::TYPE_FILE_COMPLETE;
+                buf[1..3].copy_from_slice(&40u16.to_be_bytes());
+                let p = CONTROL_HEADER_SIZE;
+                buf[p..p + 4].copy_from_slice(&transfer_id.to_be_bytes());
+                buf[p + 4..p + 8].copy_from_slice(&total_chunks.to_be_bytes());
+                buf[p + 8..p + 40].copy_from_slice(sha256);
+                buf
+            }
+            ControlMessage::FileCancel { transfer_id } => {
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 4];
+                buf[0] = Self::TYPE_FILE_CANCEL;
+                buf[1..3].copy_from_slice(&4u16.to_be_bytes());
+                buf[CONTROL_HEADER_SIZE..CONTROL_HEADER_SIZE + 4]
+                    .copy_from_slice(&transfer_id.to_be_bytes());
+                buf
+            }
+            ControlMessage::FileProgress {
+                transfer_id,
+                chunks_received,
+            } => {
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 8];
+                buf[0] = Self::TYPE_FILE_PROGRESS;
+                buf[1..3].copy_from_slice(&8u16.to_be_bytes());
+                let p = CONTROL_HEADER_SIZE;
+                buf[p..p + 4].copy_from_slice(&transfer_id.to_be_bytes());
+                buf[p + 4..p + 8].copy_from_slice(&chunks_received.to_be_bytes());
+                buf
+            }
         }
     }
 
@@ -918,6 +1036,64 @@ impl ControlMessage {
             Self::TYPE_AUTH_RESULT => {
                 let ok = payload.first().copied().unwrap_or(0) != 0;
                 ControlMessage::AuthResult(ok)
+            }
+            Self::TYPE_FILE_OFFER => {
+                if payload.len() < 14 {
+                    return None;
+                }
+                let transfer_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let file_size = u64::from_be_bytes([
+                    payload[4], payload[5], payload[6], payload[7],
+                    payload[8], payload[9], payload[10], payload[11],
+                ]);
+                let name_len = u16::from_be_bytes([payload[12], payload[13]]) as usize;
+                if payload.len() < 14 + name_len {
+                    return None;
+                }
+                let file_name = String::from_utf8_lossy(&payload[14..14 + name_len]).to_string();
+                ControlMessage::FileOffer { transfer_id, file_size, file_name }
+            }
+            Self::TYPE_FILE_ACCEPT => {
+                if payload.len() < 5 {
+                    return None;
+                }
+                let transfer_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let accepted = payload[4] != 0;
+                ControlMessage::FileAccept { transfer_id, accepted }
+            }
+            Self::TYPE_FILE_CHUNK => {
+                if payload.len() < 8 {
+                    return None;
+                }
+                let transfer_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let chunk_index = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                let data = payload[8..].to_vec();
+                ControlMessage::FileChunk { transfer_id, chunk_index, data }
+            }
+            Self::TYPE_FILE_COMPLETE => {
+                if payload.len() < 40 {
+                    return None;
+                }
+                let transfer_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let total_chunks = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                let mut sha256 = [0u8; 32];
+                sha256.copy_from_slice(&payload[8..40]);
+                ControlMessage::FileComplete { transfer_id, total_chunks, sha256 }
+            }
+            Self::TYPE_FILE_CANCEL => {
+                if payload.len() < 4 {
+                    return None;
+                }
+                let transfer_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                ControlMessage::FileCancel { transfer_id }
+            }
+            Self::TYPE_FILE_PROGRESS => {
+                if payload.len() < 8 {
+                    return None;
+                }
+                let transfer_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let chunks_received = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                ControlMessage::FileProgress { transfer_id, chunks_received }
             }
             _ => return None,
         };
@@ -1198,6 +1374,72 @@ mod tests {
     #[test]
     fn roundtrip_clipboard_text() {
         let msg = ControlMessage::ClipboardText("hello from clipboard".to_string());
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_file_offer() {
+        let msg = ControlMessage::FileOffer {
+            transfer_id: 42,
+            file_size: 1_048_576,
+            file_name: "photo.jpg".to_string(),
+        };
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_file_accept() {
+        let msg = ControlMessage::FileAccept { transfer_id: 7, accepted: true };
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_file_chunk() {
+        let msg = ControlMessage::FileChunk {
+            transfer_id: 1,
+            chunk_index: 5,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_file_complete() {
+        let msg = ControlMessage::FileComplete {
+            transfer_id: 1,
+            total_chunks: 100,
+            sha256: [0xAB; 32],
+        };
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_file_cancel() {
+        let msg = ControlMessage::FileCancel { transfer_id: 99 };
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_file_progress() {
+        let msg = ControlMessage::FileProgress { transfer_id: 1, chunks_received: 50 };
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, msg);

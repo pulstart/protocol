@@ -1,4 +1,5 @@
 pub mod control;
+pub mod file_transfer;
 pub mod frame_assembler;
 pub mod frame_slicer;
 pub mod input;
