@@ -632,6 +632,8 @@ pub enum ControlMessage {
     CursorShape(CursorShape),
     /// Server → client: remote cursor position and visibility.
     CursorState(CursorState),
+    /// Bidirectional plain-text clipboard synchronization.
+    ClipboardText(String),
     /// Client → server: authentication token.
     Authenticate(String),
     /// Server → client: authentication result (true = accepted).
@@ -658,8 +660,9 @@ impl ControlMessage {
     const TYPE_INPUT_CAPABILITIES: u8 = 16;
     const TYPE_CURSOR_SHAPE: u8 = 17;
     const TYPE_CURSOR_STATE: u8 = 18;
-    const TYPE_AUTHENTICATE: u8 = 19;
-    const TYPE_AUTH_RESULT: u8 = 20;
+    const TYPE_CLIPBOARD_TEXT: u8 = 19;
+    const TYPE_AUTHENTICATE: u8 = 20;
+    const TYPE_AUTH_RESULT: u8 = 21;
 
     /// Serialize this message into a byte vector (header + payload).
     pub fn serialize(&self) -> Vec<u8> {
@@ -809,6 +812,16 @@ impl ControlMessage {
                 buf[CONTROL_HEADER_SIZE..].copy_from_slice(&payload);
                 buf
             }
+            ControlMessage::ClipboardText(text) => {
+                let payload = text.as_bytes();
+                let len = payload.len().min(MAX_CONTROL_PAYLOAD);
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + len];
+                buf[0] = Self::TYPE_CLIPBOARD_TEXT;
+                buf[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+                buf[CONTROL_HEADER_SIZE..CONTROL_HEADER_SIZE + len]
+                    .copy_from_slice(&payload[..len]);
+                buf
+            }
             ControlMessage::Authenticate(token) => {
                 let payload = token.as_bytes();
                 let len = payload.len().min(MAX_CONTROL_PAYLOAD);
@@ -893,6 +906,10 @@ impl ControlMessage {
             }
             Self::TYPE_CURSOR_STATE => {
                 ControlMessage::CursorState(CursorState::deserialize(payload)?)
+            }
+            Self::TYPE_CLIPBOARD_TEXT => {
+                let text = String::from_utf8_lossy(payload).to_string();
+                ControlMessage::ClipboardText(text)
             }
             Self::TYPE_AUTHENTICATE => {
                 let text = String::from_utf8_lossy(payload).to_string();
@@ -1172,6 +1189,15 @@ mod tests {
             y: 80,
             visible: true,
         });
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_clipboard_text() {
+        let msg = ControlMessage::ClipboardText("hello from clipboard".to_string());
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, msg);
