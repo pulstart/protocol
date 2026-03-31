@@ -20,5 +20,6 @@ pub use input::{
     InputPacket, KeyboardKey, KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput,
     MouseRelativeInput, MouseWheelInput, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1,
     MOUSE_BUTTON_EXTRA2, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_PRIMARY, MOUSE_BUTTON_SECONDARY,
+    MOUSE_WHEEL_STEP_UNITS,
 };
 pub use packet::{FrameTimingMeta, PacketHeader, PayloadType, MAX_PAYLOAD};

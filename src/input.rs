@@ -5,6 +5,8 @@ pub const MOUSE_BUTTON_SECONDARY: u8 = 1 << 1;
 pub const MOUSE_BUTTON_MIDDLE: u8 = 1 << 2;
 pub const MOUSE_BUTTON_EXTRA1: u8 = 1 << 3;
 pub const MOUSE_BUTTON_EXTRA2: u8 = 1 << 4;
+/// High-resolution wheel units per traditional mouse-wheel notch.
+pub const MOUSE_WHEEL_STEP_UNITS: i16 = 120;
 pub const KEYBOARD_STATE_BYTES: usize = 16;
 
 const MOUSE_ABSOLUTE_PAYLOAD_SIZE: usize = 9;
@@ -206,7 +208,9 @@ impl MouseButtonsInput {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MouseWheelInput {
     pub client_id: u32,
+    /// High-resolution wheel units. `MOUSE_WHEEL_STEP_UNITS` equals one line/notch.
     pub delta_x: i16,
+    /// High-resolution wheel units. `MOUSE_WHEEL_STEP_UNITS` equals one line/notch.
     pub delta_y: i16,
     pub buttons: u8,
 }
