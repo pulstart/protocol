@@ -9,7 +9,7 @@ pub const MAX_CONTROL_PAYLOAD: usize = u16::MAX as usize;
 pub const CONTROL_HEADER_SIZE: usize = 3;
 
 /// Fixed-size payload for stream configuration.
-const STREAM_CONFIG_PAYLOAD_SIZE: usize = 17;
+const STREAM_CONFIG_PAYLOAD_SIZE: usize = 18;
 /// Fixed-size payload for client display refresh hints, client UDP receive
 /// port, and advertised video codec support.
 const CLIENT_DISPLAY_INFO_PAYLOAD_SIZE: usize = 8;
@@ -115,6 +115,30 @@ impl VideoCodecSupport {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VideoChromaSampling {
+    #[default]
+    Yuv420,
+    Yuv444,
+}
+
+impl VideoChromaSampling {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Yuv420 => 0,
+            Self::Yuv444 => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Yuv420),
+            1 => Some(Self::Yuv444),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamConfig {
     pub codec: VideoCodec,
@@ -124,6 +148,7 @@ pub struct StreamConfig {
     pub audio_sample_rate: u32,
     pub audio_channels: u8,
     pub hdr: bool,
+    pub chroma: VideoChromaSampling,
 }
 
 impl StreamConfig {
@@ -136,13 +161,16 @@ impl StreamConfig {
         buf[10..12].copy_from_slice(&self.framerate.to_be_bytes());
         buf[12..16].copy_from_slice(&self.audio_sample_rate.to_be_bytes());
         buf[16] = self.audio_channels;
+        buf[17] = self.chroma.to_u8();
         buf
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() != STREAM_CONFIG_PAYLOAD_SIZE {
-            return None;
-        }
+        let chroma = match buf.len() {
+            STREAM_CONFIG_PAYLOAD_SIZE => VideoChromaSampling::from_u8(buf[17])?,
+            17 => VideoChromaSampling::Yuv420,
+            _ => return None,
+        };
 
         Some(Self {
             codec: VideoCodec::from_u8(buf[0])?,
@@ -152,6 +180,7 @@ impl StreamConfig {
             framerate: u16::from_be_bytes([buf[10], buf[11]]),
             audio_sample_rate: u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
             audio_channels: buf[16],
+            chroma,
         })
     }
 }
@@ -162,6 +191,8 @@ pub struct ClientDisplayInfo {
     pub udp_port: u16,
     pub supported_video_codecs: VideoCodecSupport,
     pub hardware_video_codecs: VideoCodecSupport,
+    pub supported_yuv444_video_codecs: VideoCodecSupport,
+    pub hardware_yuv444_video_codecs: VideoCodecSupport,
 }
 
 impl ClientDisplayInfo {
@@ -169,8 +200,10 @@ impl ClientDisplayInfo {
         let mut buf = [0u8; CLIENT_DISPLAY_INFO_PAYLOAD_SIZE];
         buf[0..4].copy_from_slice(&self.max_refresh_millihz.to_be_bytes());
         buf[4..6].copy_from_slice(&self.udp_port.to_be_bytes());
-        buf[6] = self.supported_video_codecs.serialize();
-        buf[7] = self.hardware_video_codecs.serialize();
+        buf[6] =
+            self.supported_video_codecs.serialize() | (self.supported_yuv444_video_codecs.serialize() << 3);
+        buf[7] =
+            self.hardware_video_codecs.serialize() | (self.hardware_yuv444_video_codecs.serialize() << 3);
         buf
     }
 
@@ -182,18 +215,24 @@ impl ClientDisplayInfo {
                 udp_port: 0,
                 supported_video_codecs: legacy_supported,
                 hardware_video_codecs: VideoCodecSupport::empty(),
+                supported_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
             }),
             CLIENT_DISPLAY_INFO_PAYLOAD_SIZE => Some(Self {
                 max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
                 udp_port: u16::from_be_bytes([buf[4], buf[5]]),
                 supported_video_codecs: VideoCodecSupport::deserialize(buf[6]),
                 hardware_video_codecs: VideoCodecSupport::deserialize(buf[7]),
+                supported_yuv444_video_codecs: VideoCodecSupport::deserialize(buf[6] >> 3),
+                hardware_yuv444_video_codecs: VideoCodecSupport::deserialize(buf[7] >> 3),
             }),
             6 => Some(Self {
                 max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
                 udp_port: u16::from_be_bytes([buf[4], buf[5]]),
                 supported_video_codecs: legacy_supported,
                 hardware_video_codecs: VideoCodecSupport::empty(),
+                supported_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
             }),
             _ => None,
         }
@@ -884,6 +923,7 @@ mod tests {
             audio_sample_rate: 48_000,
             audio_channels: 2,
             hdr: true,
+            chroma: VideoChromaSampling::Yuv444,
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
@@ -925,6 +965,8 @@ mod tests {
             udp_port: 45_000,
             supported_video_codecs: VideoCodecSupport::all(),
             hardware_video_codecs: VideoCodecSupport::h264_only(),
+            supported_yuv444_video_codecs: VideoCodecSupport::all(),
+            hardware_yuv444_video_codecs: VideoCodecSupport::h264_only(),
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
@@ -947,6 +989,8 @@ mod tests {
                 udp_port: 0,
                 supported_video_codecs: VideoCodecSupport::h264_only(),
                 hardware_video_codecs: VideoCodecSupport::empty(),
+                supported_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
             })
         );
         assert_eq!(consumed, buf.len());
@@ -968,6 +1012,38 @@ mod tests {
                 udp_port: 45_000,
                 supported_video_codecs: VideoCodecSupport::h264_only(),
                 hardware_video_codecs: VideoCodecSupport::empty(),
+                supported_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
+            })
+        );
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn deserialize_legacy_stream_config_defaults_to_yuv420() {
+        let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 17];
+        buf[0] = ControlMessage::TYPE_STREAM_CONFIG;
+        buf[1..3].copy_from_slice(&(17u16).to_be_bytes());
+        buf[3] = 1;
+        buf[4] = 1;
+        buf[5..9].copy_from_slice(&2560u32.to_be_bytes());
+        buf[9..13].copy_from_slice(&1440u32.to_be_bytes());
+        buf[13..15].copy_from_slice(&120u16.to_be_bytes());
+        buf[15..19].copy_from_slice(&48_000u32.to_be_bytes());
+        buf[19] = 2;
+
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::StreamConfig(StreamConfig {
+                codec: VideoCodec::Hevc,
+                width: 2560,
+                height: 1440,
+                framerate: 120,
+                audio_sample_rate: 48_000,
+                audio_channels: 2,
+                hdr: true,
+                chroma: VideoChromaSampling::Yuv420,
             })
         );
         assert_eq!(consumed, buf.len());

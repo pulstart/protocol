@@ -11,7 +11,7 @@ pub mod reliable_udp;
 pub use control::{
     ClientDisplayInfo, ClockSyncPing, ClockSyncPong, ControlMessage, ControllerState, CursorShape,
     CursorState, InputCapabilities, InputSession, SessionDebugInfo, StreamConfig,
-    TransportFeedback, VideoCodec,
+    TransportFeedback, VideoChromaSampling, VideoCodec,
     VideoCodecSupport,
 };
 pub use frame_assembler::{CompletedFrame, FrameAssembler};
