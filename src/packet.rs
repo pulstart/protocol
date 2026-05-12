@@ -2,34 +2,87 @@
 pub const HEADER_SIZE: usize = 7;
 pub const MAX_UDP: usize = 1400;
 pub const MAX_PAYLOAD: usize = MAX_UDP - HEADER_SIZE; // 1393
-pub const AUDIO_REDUNDANCY_HEADER_SIZE: usize = 2;
 pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8;
 pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AudioRedundancyMeta {
-    pub redundant_len: u16,
+/// Maximum number of previous opus packets that can be attached to a single
+/// audio datagram. A datagram payload starts with a 1-byte chunk count, then
+/// that many u16 chunk lengths, then the primary opus packet, then each
+/// redundant chunk in oldest-first order.
+pub const AUDIO_REDUNDANCY_MAX_DEPTH: usize = 4;
+
+/// Bytes consumed by the redundancy header for `count` attached chunks
+/// (1 count byte + 2 length bytes per chunk).
+pub const fn audio_redundancy_header_size(count: usize) -> usize {
+    1 + count * 2
 }
 
-impl AudioRedundancyMeta {
-    pub fn serialize(&self, buf: &mut [u8]) {
-        assert!(
-            buf.len() >= AUDIO_REDUNDANCY_HEADER_SIZE,
-            "AudioRedundancyMeta::serialize: buffer too small"
-        );
-        buf[0..2].copy_from_slice(&self.redundant_len.to_be_bytes());
+/// Write the audio redundancy header into `buf`. `chunk_lens` is the length of
+/// each redundant chunk in oldest-first order. Returns the number of bytes
+/// written. The caller is responsible for writing the primary opus payload and
+/// the redundant chunks (in matching order) after the returned offset.
+pub fn serialize_audio_redundancy_header(buf: &mut [u8], chunk_lens: &[u16]) -> usize {
+    assert!(
+        chunk_lens.len() <= AUDIO_REDUNDANCY_MAX_DEPTH,
+        "serialize_audio_redundancy_header: too many chunks"
+    );
+    let size = audio_redundancy_header_size(chunk_lens.len());
+    assert!(
+        buf.len() >= size,
+        "serialize_audio_redundancy_header: buffer too small"
+    );
+    buf[0] = chunk_lens.len() as u8;
+    for (i, len) in chunk_lens.iter().enumerate() {
+        let offset = 1 + i * 2;
+        buf[offset..offset + 2].copy_from_slice(&len.to_be_bytes());
     }
+    size
+}
 
-    pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() < AUDIO_REDUNDANCY_HEADER_SIZE {
-            return None;
-        }
-        let redundant_len = u16::from_be_bytes([buf[0], buf[1]]);
-        if redundant_len as usize > buf.len().saturating_sub(AUDIO_REDUNDANCY_HEADER_SIZE) {
-            return None;
-        }
-        Some(Self { redundant_len })
+/// View into an audio packet payload (the bytes after the 7-byte UDP header).
+#[derive(Debug, Clone)]
+pub struct AudioPacketView<'a> {
+    pub primary: &'a [u8],
+    /// Redundant copies of previous opus packets, oldest-first.
+    /// `redundant[i]` is the opus packet at `primary_seq - (redundant.len() - i)`.
+    pub redundant: Vec<&'a [u8]>,
+}
+
+/// Parse an audio payload that contains the redundancy header, the primary
+/// opus packet, and zero or more redundant chunks (oldest-first).
+pub fn parse_audio_packet(payload: &[u8]) -> Option<AudioPacketView<'_>> {
+    if payload.is_empty() {
+        return None;
     }
+    let count = payload[0] as usize;
+    if count > AUDIO_REDUNDANCY_MAX_DEPTH {
+        return None;
+    }
+    let header_size = audio_redundancy_header_size(count);
+    if payload.len() < header_size {
+        return None;
+    }
+    let mut chunk_lens = [0usize; AUDIO_REDUNDANCY_MAX_DEPTH];
+    let mut total_chunk_bytes: usize = 0;
+    for (i, slot) in chunk_lens.iter_mut().enumerate().take(count) {
+        let offset = 1 + i * 2;
+        let len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        total_chunk_bytes = total_chunk_bytes.checked_add(len)?;
+        *slot = len;
+    }
+    let body = &payload[header_size..];
+    if total_chunk_bytes > body.len() {
+        return None;
+    }
+    let primary_len = body.len() - total_chunk_bytes;
+    let primary = &body[..primary_len];
+    let mut redundant = Vec::with_capacity(count);
+    let mut offset = primary_len;
+    for &len in &chunk_lens[..count] {
+        redundant.push(&body[offset..offset + len]);
+        offset += len;
+    }
+    Some(AudioPacketView { primary, redundant })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -228,16 +281,44 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_audio_redundancy_meta() {
-        let meta = AudioRedundancyMeta { redundant_len: 0 };
-        let mut buf = [0u8; AUDIO_REDUNDANCY_HEADER_SIZE];
-        meta.serialize(&mut buf);
-        assert_eq!(AudioRedundancyMeta::deserialize(&buf).unwrap(), meta);
+    fn audio_redundancy_roundtrip_empty() {
+        let mut buf = vec![0u8; audio_redundancy_header_size(0)];
+        let n = serialize_audio_redundancy_header(&mut buf, &[]);
+        assert_eq!(n, 1);
+        buf.extend_from_slice(b"primary");
+        let view = parse_audio_packet(&buf).unwrap();
+        assert_eq!(view.primary, b"primary");
+        assert!(view.redundant.is_empty());
     }
 
     #[test]
-    fn rejects_invalid_audio_redundancy_meta() {
-        let buf = [0x01, 0x00, 0xAA];
-        assert!(AudioRedundancyMeta::deserialize(&buf).is_none());
+    fn audio_redundancy_roundtrip_multiple_chunks() {
+        let chunks: Vec<&[u8]> = vec![b"oldest", b"middle", b"newest"];
+        let lens: Vec<u16> = chunks.iter().map(|c| c.len() as u16).collect();
+        let mut buf = vec![0u8; audio_redundancy_header_size(chunks.len())];
+        serialize_audio_redundancy_header(&mut buf, &lens);
+        buf.extend_from_slice(b"PRIMARY");
+        for chunk in &chunks {
+            buf.extend_from_slice(chunk);
+        }
+        let view = parse_audio_packet(&buf).unwrap();
+        assert_eq!(view.primary, b"PRIMARY");
+        assert_eq!(view.redundant.len(), 3);
+        assert_eq!(view.redundant[0], b"oldest");
+        assert_eq!(view.redundant[1], b"middle");
+        assert_eq!(view.redundant[2], b"newest");
+    }
+
+    #[test]
+    fn audio_redundancy_rejects_invalid_payload() {
+        // Claims one chunk but body is empty.
+        let buf = [0x01u8, 0x00, 0x10];
+        assert!(parse_audio_packet(&buf).is_none());
+        // Count exceeds the protocol limit.
+        let buf = [(AUDIO_REDUNDANCY_MAX_DEPTH as u8) + 1, 0, 0];
+        assert!(parse_audio_packet(&buf).is_none());
+        // Truncated header (count = 1 needs 3 bytes, only 2 provided).
+        let buf = [0x01u8, 0x00];
+        assert!(parse_audio_packet(&buf).is_none());
     }
 }
