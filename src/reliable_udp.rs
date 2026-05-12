@@ -26,6 +26,12 @@ pub const PUNCHED_CONTROL_OVERHEAD: usize = 1 + RELIABLE_HEADER_SIZE;
 /// Maximum number of unacked reliable messages in flight.
 const MAX_SEND_WINDOW: usize = 64;
 
+/// Hard cap on the local control backlog when the send window is full.
+/// Callers that exceed this are throttled out (`send_control` returns Err),
+/// matching the old behavior. File transfer / clipboard / etc. now ride the
+/// backlog through transient stalls instead of being silently dropped.
+const MAX_CONTROL_BACKLOG: usize = 1024;
+
 /// Initial retransmit timeout.
 const INITIAL_RTO: Duration = Duration::from_millis(200);
 
@@ -213,23 +219,30 @@ impl ReliableState {
         });
     }
 
-    /// Record an incoming sequence number. Returns the payload if it should be
-    /// delivered now, or `None` if it is a duplicate or buffered for reorder.
+    /// Record an incoming sequence number. Returns the payloads that became
+    /// deliverable in order (possibly more than one if this packet plugged a
+    /// gap), or an empty vec if it is a duplicate / buffered for reorder.
+    ///
+    /// Invariant maintained on every `recv_next++`: bitmap bit `k` means
+    /// "seq = recv_next + k + 1 has been received". Each time we advance
+    /// `recv_next`, we must shift the bitmap right by one to keep that mapping
+    /// regardless of whether we actually deliver a buffered packet.
     fn record_recv(&mut self, seq: u32, payload: Vec<u8>) -> Vec<Vec<u8>> {
         let mut deliverable = Vec::new();
 
         if seq == self.recv_next {
-            // In-order delivery.
             deliverable.push(payload);
-            self.recv_next = self.recv_next.wrapping_add(1);
-
-            // Shift bitmap and drain any buffered consecutive packets.
-            while self.recv_bitmap & 1 != 0 {
+            loop {
+                // Advance recv_next and slide the bitmap so bit 0 stays at recv_next+1.
+                self.recv_next = self.recv_next.wrapping_add(1);
+                let bit0 = self.recv_bitmap & 1 != 0;
                 self.recv_bitmap >>= 1;
+                if !bit0 {
+                    break;
+                }
                 if let Some(buffered) = self.recv_buf.remove(&self.recv_next) {
                     deliverable.push(buffered);
                 }
-                self.recv_next = self.recv_next.wrapping_add(1);
             }
         } else {
             let offset = seq.wrapping_sub(self.recv_next);
@@ -281,6 +294,14 @@ pub struct PunchedSocket {
     reliable: Mutex<ReliableState>,
     // Scratch buffers (per-thread callers clone the socket, so these are per-instance).
     encrypt_buf: Mutex<Vec<u8>>,
+    /// Messages decoded from a UDP datagram but not yet returned by `try_recv`.
+    /// A single datagram can deliver multiple control messages when an in-order
+    /// arrival drains buffered reordered packets; `try_recv` returns the first
+    /// and leaves the rest here so they aren't silently lost.
+    pending_in: Mutex<VecDeque<PunchedMessage>>,
+    /// Plaintext control payloads waiting for the reliable send window to free.
+    /// Drained by `tick()` as acks arrive.
+    pending_out: Mutex<VecDeque<Vec<u8>>>,
 }
 
 impl PunchedSocket {
@@ -293,6 +314,8 @@ impl PunchedSocket {
             crypto,
             reliable: Mutex::new(ReliableState::new()),
             encrypt_buf: Mutex::new(vec![0u8; 2048]),
+            pending_in: Mutex::new(VecDeque::new()),
+            pending_out: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -319,17 +342,15 @@ impl PunchedSocket {
         Ok(())
     }
 
-    /// Send a reliable control message (channel 1).
-    pub fn send_control(&self, data: &[u8]) -> Result<(), String> {
+    /// Try to send `data` directly. Returns `true` if it entered the reliable
+    /// send window (and was emitted on the wire), `false` if the window was full.
+    fn try_send_control_now(&self, data: &[u8]) -> bool {
         let mut state = self.reliable.lock().unwrap();
         if state.send_queue.len() >= MAX_SEND_WINDOW {
-            return Err("reliable send window full".into());
+            return false;
         }
-
         let seq = state.next_seq();
         let (ack, ack_bits) = state.ack_header();
-
-        // Build: [channel:1][seq:4][ack:4][ack_bits:4][payload]
         let total = 1 + RELIABLE_HEADER_SIZE + data.len();
         let mut plain = vec![0u8; total];
         plain[0] = CHANNEL_CONTROL;
@@ -337,21 +358,46 @@ impl PunchedSocket {
         plain[5..9].copy_from_slice(&ack.to_be_bytes());
         plain[9..13].copy_from_slice(&ack_bits.to_be_bytes());
         plain[13..].copy_from_slice(data);
-
         let encrypted = self.crypto.encrypt(&plain);
-
         state.send_queue.push_back(UnackedMessage {
             seq,
             payload: encrypted.clone(),
             last_sent: Instant::now(),
             send_count: 1,
         });
-
         drop(state);
-        self.socket
-            .send_to(&encrypted, self.peer)
-            .map_err(|e| format!("send_control: {e}"))?;
+        let _ = self.socket.send_to(&encrypted, self.peer);
+        true
+    }
+
+    /// Send a reliable control message (channel 1). If the send window is full
+    /// the payload is queued in a bounded local backlog and drained by `tick()`
+    /// as acks arrive. Only returns Err when the backlog itself is full
+    /// (1024 deep), which keeps long file-transfer bursts from being silently
+    /// dropped without unbounded memory growth.
+    pub fn send_control(&self, data: &[u8]) -> Result<(), String> {
+        if self.try_send_control_now(data) {
+            return Ok(());
+        }
+        let mut backlog = self.pending_out.lock().unwrap();
+        if backlog.len() >= MAX_CONTROL_BACKLOG {
+            return Err("reliable send backlog full".into());
+        }
+        backlog.push_back(data.to_vec());
         Ok(())
+    }
+
+    /// Drain as much of the local control backlog into the send window as
+    /// will fit. Called from `tick()`.
+    fn drain_pending_out(&self) {
+        loop {
+            let next = self.pending_out.lock().unwrap().pop_front();
+            let Some(data) = next else { break };
+            if !self.try_send_control_now(&data) {
+                self.pending_out.lock().unwrap().push_front(data);
+                break;
+            }
+        }
     }
 
     /// Send a standalone ack (channel 1, empty payload, not queued for reliability).
@@ -373,15 +419,41 @@ impl PunchedSocket {
         Ok(())
     }
 
-    /// Try to receive the next packet. Returns `None` if the socket would block.
-    /// The socket should be set to non-blocking or have a short read timeout.
+    /// Try to receive the next message. If a single UDP datagram unblocks
+    /// multiple buffered reliable packets, the first one is returned now and
+    /// the rest stay queued for subsequent `try_recv` calls — they are not
+    /// silently discarded. Returns `None` if both the queue and the socket
+    /// have nothing.
     pub fn try_recv(&self) -> Option<PunchedMessage> {
-        self.try_recv_all().into_iter().next()
+        if let Some(msg) = self.pending_in.lock().unwrap().pop_front() {
+            return Some(msg);
+        }
+        let mut msgs = self.recv_one_datagram();
+        if msgs.is_empty() {
+            return None;
+        }
+        let first = msgs.remove(0);
+        if !msgs.is_empty() {
+            self.pending_in.lock().unwrap().extend(msgs);
+        }
+        Some(first)
     }
 
-    /// Try to receive all pending messages from a single UDP read.
-    /// Returns an empty vec if the socket would block.
+    /// Try to receive everything currently available: anything queued from
+    /// prior `try_recv` calls plus one fresh UDP read. Returns empty when both
+    /// sources are dry.
     pub fn try_recv_all(&self) -> Vec<PunchedMessage> {
+        let mut out: Vec<PunchedMessage> = {
+            let mut q = self.pending_in.lock().unwrap();
+            q.drain(..).collect()
+        };
+        out.extend(self.recv_one_datagram());
+        out
+    }
+
+    /// Read one UDP datagram and decode it. Used by both `try_recv` and
+    /// `try_recv_all`.
+    fn recv_one_datagram(&self) -> Vec<PunchedMessage> {
         let mut buf = [0u8; 2048];
         let (n, _src) = match self.socket.recv_from(&mut buf) {
             Ok(r) => r,
@@ -424,7 +496,7 @@ impl PunchedSocket {
 
                 let mut state = self.reliable.lock().unwrap();
 
-                // Process piggybacked ack.
+                // Process piggybacked ack (may free room in send window).
                 state.process_ack(ack, ack_bits);
 
                 // Record received seq and get deliverable payloads.
@@ -434,6 +506,9 @@ impl PunchedSocket {
                 }
                 let delivered = state.record_recv(seq, payload);
                 drop(state);
+
+                // Acks may have freed window room — flush backlog opportunistically.
+                self.drain_pending_out();
 
                 // Send ack back.
                 let _ = self.send_ack();
@@ -461,9 +536,12 @@ impl PunchedSocket {
         None
     }
 
-    /// Retransmit unacked reliable messages that have exceeded the RTO.
+    /// Retransmit unacked reliable messages that have exceeded the RTO, and
+    /// drain any backlog that's been waiting for the send window to free.
     /// Call this periodically (e.g. every 10-50ms).
     pub fn tick(&self) {
+        // First try to push backlog into the freshly available window space.
+        self.drain_pending_out();
         let retransmits = {
             let mut state = self.reliable.lock().unwrap();
             state.collect_retransmits()
@@ -473,14 +551,16 @@ impl PunchedSocket {
         }
     }
 
-    /// Block until all queued reliable messages have been acknowledged.
+    /// Block until all queued reliable messages have been acknowledged and
+    /// the local backlog has drained.
     /// Useful during the handshake phase.
     pub fn flush_control(&self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             {
                 let state = self.reliable.lock().unwrap();
-                if state.send_queue.is_empty() {
+                let backlog_empty = self.pending_out.lock().unwrap().is_empty();
+                if state.send_queue.is_empty() && backlog_empty {
                     return Ok(());
                 }
             }
@@ -504,5 +584,63 @@ impl PunchedSocket {
         self.socket
             .set_read_timeout(dur)
             .map_err(|e| format!("set_read_timeout: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(seq: u32) -> Vec<u8> {
+        seq.to_be_bytes().to_vec()
+    }
+
+    /// Regression guard for the bitmap-alignment bug. seq=7 arrives first
+    /// (buffered at offset 2 from recv_next=5). Then seq=5 arrives in-order.
+    /// The old code exited the drain loop early because bit 0 was 0 (seq 6
+    /// missing) and never shifted the bitmap, leaving bit 1 set under the new
+    /// recv_next=6 alignment — which then mis-flagged a future seq=8 as a
+    /// duplicate AND stranded seq=7 in recv_buf.
+    #[test]
+    fn record_recv_bitmap_stays_aligned_after_gap() {
+        let mut s = ReliableState::new();
+        s.recv_next = 5;
+
+        // seq=7 arrives first.
+        assert!(s.record_recv(7, p(7)).is_empty());
+        assert_eq!(s.recv_next, 5);
+        assert_eq!(s.recv_bitmap, 0b10); // bit 1 = seq recv_next+2
+
+        // seq=5 in-order. recv_next must advance to 6; bitmap must slide to
+        // 0b01 so it still says "seq recv_next+1 (= 7) is buffered".
+        let delivered = s.record_recv(5, p(5));
+        assert_eq!(delivered, vec![p(5)]);
+        assert_eq!(s.recv_next, 6);
+        assert_eq!(s.recv_bitmap, 0b01);
+
+        // seq=6 in-order must drain seq=7 as well.
+        let delivered = s.record_recv(6, p(6));
+        assert_eq!(delivered, vec![p(6), p(7)]);
+        assert_eq!(s.recv_next, 8);
+        assert_eq!(s.recv_bitmap, 0);
+        assert!(s.recv_buf.is_empty());
+
+        // After the drain, seq=9 arrives with seq=8 still missing. Must be
+        // recorded as buffered (bit 0), NOT mis-flagged as duplicate.
+        assert!(s.record_recv(9, p(9)).is_empty());
+        assert_eq!(s.recv_bitmap, 0b01);
+    }
+
+    /// seq=6 buffered before seq=5; in-order arrival of seq=5 should drain
+    /// both. The bitmap must end at 0.
+    #[test]
+    fn record_recv_drain_consecutive_buffered() {
+        let mut s = ReliableState::new();
+        s.recv_next = 5;
+        assert!(s.record_recv(6, p(6)).is_empty());
+        let delivered = s.record_recv(5, p(5));
+        assert_eq!(delivered, vec![p(5), p(6)]);
+        assert_eq!(s.recv_next, 7);
+        assert_eq!(s.recv_bitmap, 0);
     }
 }

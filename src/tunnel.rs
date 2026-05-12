@@ -192,6 +192,13 @@ pub fn hole_punch(
         return Err("no partner candidates".into());
     }
 
+    // The punch socket is reused across sessions. A previous live session may
+    // have left it non-blocking — clear that explicitly so set_read_timeout
+    // actually delivers a 100 ms blocking wait instead of a 100 % CPU spin
+    // returning WouldBlock immediately for the full 10 s timeout window.
+    socket
+        .set_nonblocking(false)
+        .map_err(|e| format!("set_nonblocking(false): {e}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
@@ -249,132 +256,183 @@ pub fn hole_punch(
 // STUN public IP discovery
 // ---------------------------------------------------------------------------
 
-/// Discover the public IP:port via a minimal STUN Binding Request.
-///
-/// Sends a single STUN Binding Request to a public STUN server and parses the
-/// XOR-MAPPED-ADDRESS from the response. This reveals the NAT's external mapping
-/// for the given local socket, which is exactly what hole punching needs.
-///
-/// `local_socket` must already be bound. The STUN response is received on the
-/// same socket so the NAT mapping is consistent with subsequent hole-punch probes.
-///
-/// Returns `Some(SocketAddr)` with the public IP:port, or `None` on failure.
-pub fn stun_discover_public_addr(local_socket: &UdpSocket) -> Option<SocketAddr> {
-    // STUN servers to try (Google, Cloudflare).
-    const STUN_SERVERS: &[&str] = &[
-        "stun.l.google.com:19302",
-        "stun.cloudflare.com:3478",
-    ];
+/// Public STUN servers we query. Multiple servers serve two purposes:
+///   (1) redundancy if one is unreachable
+///   (2) detecting symmetric NAT — different external ports for different
+///       destinations means the NAT allocates per-(dst_ip, dst_port). We
+///       use that signal to seed port-prediction candidates.
+const STUN_SERVERS: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun1.l.google.com:19302",
+];
 
-    // Build a minimal STUN Binding Request (RFC 5389).
+/// Send one STUN Binding Request and parse the XOR-MAPPED-ADDRESS.
+/// `local_socket` must already be bound; the response is received on the
+/// same socket so the NAT mapping is consistent with subsequent hole-punch
+/// probes from that socket.
+fn stun_query_one(local_socket: &UdpSocket, server: &str) -> Option<SocketAddr> {
     // Header: type(2) + length(2) + magic_cookie(4) + transaction_id(12) = 20 bytes.
     let mut request = [0u8; 20];
-    // Message Type: 0x0001 (Binding Request)
     request[0] = 0x00;
     request[1] = 0x01;
-    // Message Length: 0 (no attributes)
     request[2] = 0x00;
     request[3] = 0x00;
-    // Magic Cookie: 0x2112A442
     request[4] = 0x21;
     request[5] = 0x12;
     request[6] = 0xA4;
     request[7] = 0x42;
-    // Transaction ID: 12 random bytes
     let tx_id: [u8; 12] = rand::random();
     request[8..20].copy_from_slice(&tx_id);
 
-    let prev_timeout = local_socket.read_timeout().ok().flatten();
-    let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
+    let addr: SocketAddr = server.to_socket_addrs().ok()?.next()?;
+    local_socket.send_to(&request, addr).ok()?;
 
-    for server in STUN_SERVERS {
-        // Resolve STUN server address.
-        let addr: SocketAddr = match server.to_socket_addrs() {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
-                None => continue,
-            },
-            Err(_) => continue,
-        };
-
-        // Send request.
-        if local_socket.send_to(&request, addr).is_err() {
-            continue;
-        }
-
-        // Receive response.
-        let mut buf = [0u8; 256];
-        let n = match local_socket.recv_from(&mut buf) {
-            Ok((n, _)) => n,
-            Err(_) => continue,
-        };
-
-        if n < 20 {
-            continue;
-        }
-
-        // Verify it's a Binding Success Response (0x0101) with matching transaction ID.
-        if buf[0] != 0x01 || buf[1] != 0x01 {
-            continue;
-        }
-        if buf[8..20] != tx_id {
-            continue;
-        }
-
-        // Parse attributes looking for XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001).
-        let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-        let attr_end = (20 + msg_len).min(n);
-        let mut pos = 20;
-        while pos + 4 <= attr_end {
-            let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-            let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
-            let attr_start = pos + 4;
-            let attr_data_end = attr_start + attr_len;
-            if attr_data_end > attr_end {
-                break;
-            }
-
-            if attr_type == 0x0020 && attr_len >= 8 {
-                // XOR-MAPPED-ADDRESS
-                let family = buf[attr_start + 1];
-                if family == 0x01 {
-                    // IPv4
-                    let xor_port =
-                        u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
-                    let xor_ip = u32::from_be_bytes([
-                        buf[attr_start + 4],
-                        buf[attr_start + 5],
-                        buf[attr_start + 6],
-                        buf[attr_start + 7],
-                    ]) ^ 0x2112A442;
-                    let ip = std::net::Ipv4Addr::from(xor_ip);
-                    let _ = local_socket.set_read_timeout(prev_timeout);
-                    return Some(SocketAddr::new(std::net::IpAddr::V4(ip), xor_port));
-                }
-            } else if attr_type == 0x0001 && attr_len >= 8 {
-                // MAPPED-ADDRESS (fallback)
-                let family = buf[attr_start + 1];
-                if family == 0x01 {
-                    let port =
-                        u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]);
-                    let ip = std::net::Ipv4Addr::new(
-                        buf[attr_start + 4],
-                        buf[attr_start + 5],
-                        buf[attr_start + 6],
-                        buf[attr_start + 7],
-                    );
-                    let _ = local_socket.set_read_timeout(prev_timeout);
-                    return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
-                }
-            }
-
-            // Advance to next attribute (padded to 4-byte boundary).
-            pos = attr_start + ((attr_len + 3) & !3);
-        }
+    let mut buf = [0u8; 256];
+    let n = local_socket.recv_from(&mut buf).ok()?.0;
+    if n < 20 || buf[0] != 0x01 || buf[1] != 0x01 || buf[8..20] != tx_id {
+        return None;
     }
 
-    let _ = local_socket.set_read_timeout(prev_timeout);
+    let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let attr_end = (20 + msg_len).min(n);
+    let mut pos = 20;
+    while pos + 4 <= attr_end {
+        let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+        let attr_start = pos + 4;
+        let attr_data_end = attr_start + attr_len;
+        if attr_data_end > attr_end {
+            break;
+        }
+        if attr_type == 0x0020 && attr_len >= 8 && buf[attr_start + 1] == 0x01 {
+            let xor_port =
+                u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
+            let xor_ip = u32::from_be_bytes([
+                buf[attr_start + 4],
+                buf[attr_start + 5],
+                buf[attr_start + 6],
+                buf[attr_start + 7],
+            ]) ^ 0x2112A442;
+            let ip = std::net::Ipv4Addr::from(xor_ip);
+            return Some(SocketAddr::new(std::net::IpAddr::V4(ip), xor_port));
+        } else if attr_type == 0x0001 && attr_len >= 8 && buf[attr_start + 1] == 0x01 {
+            let port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]);
+            let ip = std::net::Ipv4Addr::new(
+                buf[attr_start + 4],
+                buf[attr_start + 5],
+                buf[attr_start + 6],
+                buf[attr_start + 7],
+            );
+            return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+        }
+        pos = attr_start + ((attr_len + 3) & !3);
+    }
     None
+}
+
+/// Discover the public IP:port via STUN. Tries each configured server until
+/// one succeeds. Returns the first successful XOR-MAPPED-ADDRESS.
+pub fn stun_discover_public_addr(local_socket: &UdpSocket) -> Option<SocketAddr> {
+    let prev_timeout = local_socket.read_timeout().ok().flatten();
+    let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
+    let result = STUN_SERVERS.iter().find_map(|s| stun_query_one(local_socket, s));
+    let _ = local_socket.set_read_timeout(prev_timeout);
+    result
+}
+
+/// Query every configured STUN server from `local_socket` and return all
+/// distinct results, in query order. If the NAT is full/restricted-cone every
+/// query returns the same `ip:port`. If the NAT is symmetric the results
+/// differ by destination — that delta is what `predict_symmetric_candidates`
+/// later uses to guess the next port allocation for the peer.
+pub fn stun_discover_all(local_socket: &UdpSocket) -> Vec<SocketAddr> {
+    let prev_timeout = local_socket.read_timeout().ok().flatten();
+    let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut out = Vec::new();
+    for server in STUN_SERVERS {
+        if let Some(addr) = stun_query_one(local_socket, server) {
+            // Dedupe — cone NATs will give the same answer to all queries.
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    let _ = local_socket.set_read_timeout(prev_timeout);
+    out
+}
+
+/// How many predicted ports we emit on each side of the observed STUN port
+/// when symmetric NAT is detected. The peer probes all of them; matching one
+/// is enough for the connection to succeed. Wider window = better odds vs.
+/// concurrent UDP traffic on the host stealing port allocations, capped to
+/// keep the probe set small.
+pub const SYMMETRIC_PREDICTION_WINDOW: u16 = 6;
+
+/// Given the observed STUN results (in query order), decide whether the NAT
+/// behaves like a "sequential symmetric" — different but predictable port per
+/// destination — and if so, return additional `ip:port` candidate strings
+/// covering the next likely port allocations. The peer then includes those
+/// in its punch probe set.
+///
+/// Returns `Vec::new()` if the NAT looks cone-shaped (all observations share
+/// the same port) or random-symmetric (deltas are inconsistent / too large).
+pub fn predict_symmetric_candidates(stun_observations: &[SocketAddr]) -> Vec<String> {
+    if stun_observations.len() < 2 {
+        return Vec::new();
+    }
+
+    // All observations must come from the same public IP to compose into a
+    // single candidate set. Mixed IPs (e.g. dual-stack edge cases) are not
+    // worth predicting around.
+    let ip = stun_observations[0].ip();
+    if !stun_observations.iter().all(|a| a.ip() == ip) {
+        return Vec::new();
+    }
+
+    // Cone NAT — same port across destinations. No prediction needed.
+    let ports: Vec<u16> = stun_observations.iter().map(|a| a.port()).collect();
+    if ports.iter().all(|p| *p == ports[0]) {
+        return Vec::new();
+    }
+
+    // Sort and compute deltas. A "predictable symmetric" NAT shows small,
+    // roughly consistent deltas (often exactly 1). If deltas explode or
+    // disagree the NAT is randomly allocating — prediction is pointless.
+    let mut sorted = ports.clone();
+    sorted.sort_unstable();
+    let mut deltas = Vec::with_capacity(sorted.len() - 1);
+    for w in sorted.windows(2) {
+        let d = w[1].saturating_sub(w[0]);
+        if d == 0 {
+            continue; // duplicate observation, ignore
+        }
+        deltas.push(d);
+    }
+    if deltas.is_empty() {
+        return Vec::new();
+    }
+    let min_delta = *deltas.iter().min().unwrap();
+    let max_delta = *deltas.iter().max().unwrap();
+    // Reject if any delta is huge (random NAT) or if min/max disagree wildly.
+    if max_delta > 16 || max_delta > min_delta.saturating_mul(4).max(1) {
+        return Vec::new();
+    }
+    // Use the smallest observed delta as our stride — it's the closest to the
+    // NAT's "true" per-destination increment; larger gaps came from other
+    // sockets stealing allocations between our queries.
+    let stride = min_delta.max(1);
+    let base = *sorted.last().unwrap();
+
+    let mut out = Vec::with_capacity(SYMMETRIC_PREDICTION_WINDOW as usize);
+    for k in 1..=SYMMETRIC_PREDICTION_WINDOW {
+        if let Some(p) = base.checked_add(stride.saturating_mul(k)) {
+            out.push(SocketAddr::new(ip, p).to_string());
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -467,34 +525,44 @@ fn enumerate_local_ips() -> Vec<std::net::IpAddr> {
     ips
 }
 
+/// Hard cap on the candidate list we advertise. Punching is O(N) probes per
+/// round, and on multi-NIC hosts (Docker bridges, libvirt, VPN clients, etc.)
+/// `enumerate_local_ips` can produce 10+ addresses that the partner has no
+/// route to. 16 is plenty for any realistic deployment.
+pub const MAX_GATHERED_CANDIDATES: usize = 16;
+
 /// Like `gather_local_candidates`, but also performs STUN discovery on the given socket.
+///
+/// Candidate ordering:
+///   1. default-route local IP (the one that would actually carry outbound traffic)
+///   2. STUN-discovered public IP:port(s) (what the partner across the internet sees)
+///   3. predicted symmetric-NAT ports if the NAT looks predictable (gives
+///      the peer something to probe when standard hole punching would fail)
+///   4. remaining non-loopback local IPs (additional NICs / VPN tunnels)
+///
+/// The list is deduplicated and capped at `MAX_GATHERED_CANDIDATES`.
 pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -> Vec<String> {
     use std::net::UdpSocket as StdUdp;
 
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
 
-    // Default-route local IP via unconnected UDP trick.
+    // 1. Default-route local IP via unconnected UDP trick — the partner is
+    //    most likely reachable at the same NIC that exits the host.
     if let Ok(sock) = StdUdp::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
             if let Ok(local) = sock.local_addr() {
-                let c = format!("{}:{port}", local.ip());
-                candidates.push(c);
+                candidates.push(format!("{}:{port}", local.ip()));
             }
         }
     }
 
-    // Enumerate all non-loopback IPs from local network interfaces.
-    for ip in enumerate_local_ips() {
-        let c = format!("{ip}:{port}");
-        if !candidates.contains(&c) {
-            candidates.push(c);
-        }
-    }
-
-    // Discover public IP:port via STUN.
+    // 2. STUN discovery — query every configured server so we can also detect
+    //    symmetric NAT (different external port per destination).
+    let mut stun_obs: Vec<SocketAddr> = Vec::new();
     if let Some(sock) = stun_socket {
-        if let Some(public_addr) = stun_discover_public_addr(sock) {
-            let c = public_addr.to_string();
+        stun_obs = stun_discover_all(sock);
+        for addr in &stun_obs {
+            let c = addr.to_string();
             if !candidates.contains(&c) {
                 eprintln!("[stun] Discovered public address: {c}");
                 candidates.push(c);
@@ -502,5 +570,97 @@ pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -
         }
     }
 
+    // 3. Symmetric-NAT port prediction. When STUN saw different ports across
+    //    destinations, the NAT is symmetric; if the per-destination delta is
+    //    small and consistent we can guess the next several port allocations
+    //    and let the peer probe them. Useful fraction of symmetric NATs use
+    //    sequential allocation (Linux netfilter MASQUERADE, older home routers).
+    let predicted = predict_symmetric_candidates(&stun_obs);
+    if !predicted.is_empty() {
+        eprintln!(
+            "[stun] Symmetric NAT detected; advertising {} predicted port(s)",
+            predicted.len()
+        );
+        for c in predicted {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        }
+    }
+
+    // 4. Other non-loopback IPs from local interfaces — useful for VPN/LAN
+    //    paths the partner shares but we don't route through.
+    for ip in enumerate_local_ips() {
+        if candidates.len() >= MAX_GATHERED_CANDIDATES {
+            break;
+        }
+        let c = format!("{ip}:{port}");
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+
+    candidates.truncate(MAX_GATHERED_CANDIDATES);
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn sa(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(ip.parse::<Ipv4Addr>().unwrap()), port)
+    }
+
+    #[test]
+    fn prediction_skipped_when_fewer_than_two_observations() {
+        assert!(predict_symmetric_candidates(&[]).is_empty());
+        assert!(predict_symmetric_candidates(&[sa("1.2.3.4", 50000)]).is_empty());
+    }
+
+    #[test]
+    fn prediction_skipped_for_cone_nat() {
+        // Same port for both STUN servers → cone NAT, no prediction needed.
+        let obs = vec![sa("1.2.3.4", 50000), sa("1.2.3.4", 50000)];
+        assert!(predict_symmetric_candidates(&obs).is_empty());
+    }
+
+    #[test]
+    fn prediction_emits_sequential_ports_for_symmetric_nat() {
+        // delta = 1 between observations → sequential symmetric.
+        let obs = vec![sa("1.2.3.4", 50000), sa("1.2.3.4", 50001)];
+        let preds = predict_symmetric_candidates(&obs);
+        assert_eq!(preds.len(), SYMMETRIC_PREDICTION_WINDOW as usize);
+        // Starts at base = 50001 (max observed), stride = 1.
+        assert_eq!(preds[0], "1.2.3.4:50002");
+        assert_eq!(preds[1], "1.2.3.4:50003");
+    }
+
+    #[test]
+    fn prediction_skipped_for_random_symmetric() {
+        // Huge jump between observations → random allocation, prediction useless.
+        let obs = vec![sa("1.2.3.4", 50000), sa("1.2.3.4", 62000)];
+        assert!(predict_symmetric_candidates(&obs).is_empty());
+    }
+
+    #[test]
+    fn prediction_uses_smallest_observed_delta_as_stride() {
+        // Three observations with deltas 1 and 3 — concurrent socket stole one
+        // port between observation 2 and 3. Smaller delta is the truer stride.
+        let obs = vec![
+            sa("1.2.3.4", 50000),
+            sa("1.2.3.4", 50001),
+            sa("1.2.3.4", 50004),
+        ];
+        let preds = predict_symmetric_candidates(&obs);
+        assert!(!preds.is_empty());
+        assert_eq!(preds[0], "1.2.3.4:50005"); // base 50004 + stride 1
+    }
+
+    #[test]
+    fn prediction_rejected_on_mixed_ips() {
+        let obs = vec![sa("1.2.3.4", 50000), sa("5.6.7.8", 50001)];
+        assert!(predict_symmetric_candidates(&obs).is_empty());
+    }
 }

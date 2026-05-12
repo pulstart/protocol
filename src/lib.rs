@@ -8,6 +8,8 @@ pub mod packet;
 pub mod tunnel;
 #[cfg(feature = "tunnel")]
 pub mod reliable_udp;
+#[cfg(feature = "tunnel")]
+pub mod portmap;
 
 pub use control::{
     ClientDisplayInfo, ClockSyncPing, ClockSyncPong, ControlMessage, ControllerState, CursorShape,
