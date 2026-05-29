@@ -100,9 +100,14 @@ pub struct TransferInfo {
 }
 
 impl TransferInfo {
-    pub fn new_send(transfer_id: u32, file_name: String, file_size: u64, mode: TransportMode) -> Self {
+    pub fn new_send(
+        transfer_id: u32,
+        file_name: String,
+        file_size: u64,
+        mode: TransportMode,
+    ) -> Self {
         let chunk_size = mode.chunk_size();
-        let chunks_total = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
+        let chunks_total = file_size.div_ceil(chunk_size as u64) as u32;
         Self {
             transfer_id,
             direction: TransferDirection::Sending,
@@ -122,7 +127,7 @@ impl TransferInfo {
         mode: TransportMode,
     ) -> Self {
         let chunk_size = mode.chunk_size();
-        let chunks_total = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
+        let chunks_total = file_size.div_ceil(chunk_size as u64) as u32;
         Self {
             transfer_id,
             direction: TransferDirection::Receiving,
@@ -153,17 +158,10 @@ impl TransferInfo {
 /// Returns `None` if the filename is empty or entirely invalid.
 pub fn sanitize_filename(raw: &str) -> Option<String> {
     // Take only the final path component (handle both / and \).
-    let name = raw
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or("");
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or("");
 
     // Reject empty, dot-only, null bytes, or ".." traversal.
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('\0')
-    {
+    if name.is_empty() || name == "." || name == ".." || name.contains('\0') {
         return None;
     }
 
@@ -205,7 +203,10 @@ mod tests {
     #[test]
     fn sanitize_strips_path() {
         assert_eq!(sanitize_filename("/etc/passwd"), Some("passwd".into()));
-        assert_eq!(sanitize_filename("C:\\Users\\foo\\doc.txt"), Some("doc.txt".into()));
+        assert_eq!(
+            sanitize_filename("C:\\Users\\foo\\doc.txt"),
+            Some("doc.txt".into())
+        );
     }
 
     #[test]

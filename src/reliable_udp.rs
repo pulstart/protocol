@@ -209,8 +209,8 @@ impl ReliableState {
                 let rtt = now.duration_since(msg.last_sent);
                 // Exponential moving average: rtt_est = 0.875 * rtt_est + 0.125 * rtt.
                 self.rtt_estimate = Duration::from_micros(
-                    (self.rtt_estimate.as_micros() as u64 * 7 / 8
-                        + rtt.as_micros() as u64 / 8) as u64,
+                    (self.rtt_estimate.as_micros() as u64 * 7 / 8 + rtt.as_micros() as u64 / 8)
+                        as u64,
                 );
                 self.rto = (self.rtt_estimate * 2).max(MIN_RTO).min(MAX_RTO);
             }
@@ -335,7 +335,9 @@ impl PunchedSocket {
         buf.resize(packet_len, 0);
         buf[12] = CHANNEL_MEDIA;
         buf[13..13 + data.len()].copy_from_slice(data);
-        let encrypted_len = self.crypto.encrypt_staged_in_place(&mut buf[..packet_len], plain_len);
+        let encrypted_len = self
+            .crypto
+            .encrypt_staged_in_place(&mut buf[..packet_len], plain_len);
         self.socket
             .send_to(&buf[..encrypted_len], self.peer)
             .map_err(|e| format!("send_media: {e}"))?;
@@ -483,15 +485,12 @@ impl PunchedSocket {
                 if plaintext.len() < 1 + RELIABLE_HEADER_SIZE {
                     return Vec::new();
                 }
-                let seq = u32::from_be_bytes([
-                    plaintext[1], plaintext[2], plaintext[3], plaintext[4],
-                ]);
-                let ack = u32::from_be_bytes([
-                    plaintext[5], plaintext[6], plaintext[7], plaintext[8],
-                ]);
-                let ack_bits = u32::from_be_bytes([
-                    plaintext[9], plaintext[10], plaintext[11], plaintext[12],
-                ]);
+                let seq =
+                    u32::from_be_bytes([plaintext[1], plaintext[2], plaintext[3], plaintext[4]]);
+                let ack =
+                    u32::from_be_bytes([plaintext[5], plaintext[6], plaintext[7], plaintext[8]]);
+                let ack_bits =
+                    u32::from_be_bytes([plaintext[9], plaintext[10], plaintext[11], plaintext[12]]);
                 let payload = plaintext[1 + RELIABLE_HEADER_SIZE..].to_vec();
 
                 let mut state = self.reliable.lock().unwrap();
@@ -515,10 +514,7 @@ impl PunchedSocket {
 
                 // Return all deliverable messages (in-order + any consecutive
                 // buffered packets that became deliverable).
-                delivered
-                    .into_iter()
-                    .map(PunchedMessage::Control)
-                    .collect()
+                delivered.into_iter().map(PunchedMessage::Control).collect()
             }
             _ => Vec::new(),
         }

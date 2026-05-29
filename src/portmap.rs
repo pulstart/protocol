@@ -171,7 +171,7 @@ fn try_pcp_map(gw: SocketAddr, internal_port: u16, lifetime: u32) -> Option<Port
     // Common header
     req[0] = 2; // version
     req[1] = 0x01; // R=0 (request), opcode=1 (MAP)
-    // [2..4] reserved
+                   // [2..4] reserved
     req[4..8].copy_from_slice(&lifetime.to_be_bytes());
     // [8..24] client IP as IPv4-mapped IPv6: ::ffff:a.b.c.d
     req[18] = 0xff;
@@ -181,10 +181,10 @@ fn try_pcp_map(gw: SocketAddr, internal_port: u16, lifetime: u32) -> Option<Port
     let nonce: [u8; 12] = rand::thread_rng().gen();
     req[24..36].copy_from_slice(&nonce);
     req[36] = 17; // UDP
-    // [37..40] reserved
+                  // [37..40] reserved
     req[40..42].copy_from_slice(&internal_port.to_be_bytes());
     req[42..44].copy_from_slice(&internal_port.to_be_bytes()); // suggest same port
-    // [44..60] suggested external IP = ::ffff:0.0.0.0 = "any"
+                                                               // [44..60] suggested external IP = ::ffff:0.0.0.0 = "any"
     req[54] = 0xff;
     req[55] = 0xff;
 
@@ -230,12 +230,7 @@ fn try_pcp_map(gw: SocketAddr, internal_port: u16, lifetime: u32) -> Option<Port
         if !is_v4_mapped {
             return None;
         }
-        let external_ip = Ipv4Addr::new(
-            ext_bytes[12],
-            ext_bytes[13],
-            ext_bytes[14],
-            ext_bytes[15],
-        );
+        let external_ip = Ipv4Addr::new(ext_bytes[12], ext_bytes[13], ext_bytes[14], ext_bytes[15]);
 
         return Some(PortMapping {
             external_addr: SocketAddr::new(IpAddr::V4(external_ip), external_port),

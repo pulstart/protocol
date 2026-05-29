@@ -11,6 +11,12 @@ pub struct FrameSlicer {
     parity_packet: Vec<u8>,
 }
 
+impl Default for FrameSlicer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameSlicer {
     pub fn new() -> Self {
         Self::with_max_udp(crate::packet::MAX_UDP)
@@ -47,7 +53,8 @@ impl FrameSlicer {
     /// - 2-byte `total_packets`
     /// - 8-byte server capture timestamp
     /// - 8-byte server send timestamp
-    /// followed by NAL data.
+    ///
+    /// ...all followed by the NAL data itself.
     pub fn slice(&mut self, nal_data: &[u8], frame_id: u32) -> &[Vec<u8>] {
         self.slice_with_meta(nal_data, frame_id, FrameTimingMeta::default())
     }
@@ -88,7 +95,7 @@ impl FrameSlicer {
             1u16
         } else {
             let remaining = nal_data.len() - first_payload_cap;
-            1 + ((remaining + chunk_payload_cap - 1) / chunk_payload_cap) as u16
+            1 + remaining.div_ceil(chunk_payload_cap) as u16
         };
 
         // Reuse packet vec — grow if needed, shrink if too many
@@ -176,13 +183,11 @@ impl FrameSlicer {
                 timing,
             }
             .serialize(
-                &mut self.parity_packet
-                    [HEADER_SIZE..HEADER_SIZE + FRAME_PARITY_HEADER_SIZE],
+                &mut self.parity_packet[HEADER_SIZE..HEADER_SIZE + FRAME_PARITY_HEADER_SIZE],
             );
             self.parity_packet[HEADER_SIZE + FRAME_PARITY_HEADER_SIZE..]
                 .copy_from_slice(&self.parity_data);
         }
-
     }
 }
 

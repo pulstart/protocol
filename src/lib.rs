@@ -5,17 +5,16 @@ pub mod frame_slicer;
 pub mod input;
 pub mod packet;
 #[cfg(feature = "tunnel")]
-pub mod tunnel;
+pub mod portmap;
 #[cfg(feature = "tunnel")]
 pub mod reliable_udp;
 #[cfg(feature = "tunnel")]
-pub mod portmap;
+pub mod tunnel;
 
 pub use control::{
     ClientDisplayInfo, ClockSyncPing, ClockSyncPong, ControlMessage, ControllerState, CursorShape,
     CursorState, InputCapabilities, InputSession, SessionDebugInfo, StreamConfig,
-    TransportFeedback, VideoChromaSampling, VideoCodec,
-    VideoCodecSupport,
+    TransportFeedback, VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
 pub use frame_assembler::{CompletedFrame, FrameAssembler};
 pub use frame_slicer::FrameSlicer;

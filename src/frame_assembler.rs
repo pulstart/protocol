@@ -43,6 +43,12 @@ pub struct FrameAssembler {
     has_completed: bool,
 }
 
+impl Default for FrameAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameAssembler {
     pub fn new() -> Self {
         Self {
@@ -412,21 +418,24 @@ mod tests {
         let mut assembler = FrameAssembler::new();
 
         let original = vec![0x7C; 8_000];
-        let packets = slicer.slice_with_meta(
-            &original,
-            12,
-            FrameTimingMeta {
-                capture_ts_micros: 100,
-                send_ts_micros: 200,
-            },
-        )
-        .to_vec();
+        let packets = slicer
+            .slice_with_meta(
+                &original,
+                12,
+                FrameTimingMeta {
+                    capture_ts_micros: 100,
+                    send_ts_micros: 200,
+                },
+            )
+            .to_vec();
         let parity = slicer.parity_packet().unwrap().to_vec();
 
         for pkt in packets.iter().skip(1) {
             assert!(assembler.ingest(pkt).is_none());
         }
-        let recovered = assembler.ingest(&parity).expect("parity should recover first packet");
+        let recovered = assembler
+            .ingest(&parity)
+            .expect("parity should recover first packet");
         assert_eq!(recovered.frame_id, 12);
         assert_eq!(recovered.data, original);
         assert_eq!(

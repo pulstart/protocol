@@ -59,8 +59,8 @@ pub struct CryptoContext {
 
 impl CryptoContext {
     pub fn new(shared_key: [u8; 32], is_host: bool) -> Self {
-        let cipher = ChaCha20Poly1305::new_from_slice(&shared_key)
-            .expect("shared_key must be 32 bytes");
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&shared_key).expect("shared_key must be 32 bytes");
         Self {
             cipher,
             send_counter: AtomicU64::new(0),
@@ -306,8 +306,7 @@ fn stun_query_one(local_socket: &UdpSocket, server: &str) -> Option<SocketAddr> 
             break;
         }
         if attr_type == 0x0020 && attr_len >= 8 && buf[attr_start + 1] == 0x01 {
-            let xor_port =
-                u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
+            let xor_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
             let xor_ip = u32::from_be_bytes([
                 buf[attr_start + 4],
                 buf[attr_start + 5],
@@ -336,7 +335,9 @@ fn stun_query_one(local_socket: &UdpSocket, server: &str) -> Option<SocketAddr> 
 pub fn stun_discover_public_addr(local_socket: &UdpSocket) -> Option<SocketAddr> {
     let prev_timeout = local_socket.read_timeout().ok().flatten();
     let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
-    let result = STUN_SERVERS.iter().find_map(|s| stun_query_one(local_socket, s));
+    let result = STUN_SERVERS
+        .iter()
+        .find_map(|s| stun_query_one(local_socket, s));
     let _ = local_socket.set_read_timeout(prev_timeout);
     result
 }
