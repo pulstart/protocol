@@ -592,6 +592,75 @@ impl CursorState {
     }
 }
 
+/// One capturable display/monitor reported by the server.
+///
+/// `id` is a stable, server-assigned identifier the client echoes back in
+/// `SelectOutput`. `x`/`y` are the output's position in the virtual desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputInfo {
+    pub id: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    pub is_primary: bool,
+}
+
+impl OutputInfo {
+    const MAX_NAME_LEN: usize = 255;
+    /// Bytes after the name: id + width + height + x + y + primary flag.
+    const FIXED_TAIL: usize = 4 + 4 + 4 + 4 + 4 + 1;
+
+    fn write_into(&self, buf: &mut Vec<u8>) {
+        let name = self.name.as_bytes();
+        let name_len = name.len().min(Self::MAX_NAME_LEN);
+        buf.push(name_len as u8);
+        buf.extend_from_slice(&name[..name_len]);
+        buf.extend_from_slice(&self.id.to_be_bytes());
+        buf.extend_from_slice(&self.width.to_be_bytes());
+        buf.extend_from_slice(&self.height.to_be_bytes());
+        buf.extend_from_slice(&self.x.to_be_bytes());
+        buf.extend_from_slice(&self.y.to_be_bytes());
+        buf.push(u8::from(self.is_primary));
+    }
+
+    /// Read one output from `buf` starting at `*pos`, advancing `*pos` past it.
+    fn read_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
+        let name_len = *buf.get(*pos)? as usize;
+        let name_start = *pos + 1;
+        let name_end = name_start.checked_add(name_len)?;
+        let tail_end = name_end.checked_add(Self::FIXED_TAIL)?;
+        if buf.len() < tail_end {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&buf[name_start..name_end]).to_string();
+        let mut q = name_end;
+        let id = u32::from_be_bytes([buf[q], buf[q + 1], buf[q + 2], buf[q + 3]]);
+        q += 4;
+        let width = u32::from_be_bytes([buf[q], buf[q + 1], buf[q + 2], buf[q + 3]]);
+        q += 4;
+        let height = u32::from_be_bytes([buf[q], buf[q + 1], buf[q + 2], buf[q + 3]]);
+        q += 4;
+        let x = i32::from_be_bytes([buf[q], buf[q + 1], buf[q + 2], buf[q + 3]]);
+        q += 4;
+        let y = i32::from_be_bytes([buf[q], buf[q + 1], buf[q + 2], buf[q + 3]]);
+        q += 4;
+        let is_primary = buf[q] != 0;
+        q += 1;
+        *pos = q;
+        Some(Self {
+            id,
+            name,
+            width,
+            height,
+            x,
+            y,
+            is_primary,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMessage {
     /// Server-selected stream parameters.
@@ -670,6 +739,13 @@ pub enum ControlMessage {
         transfer_id: u32,
         chunks_received: u32,
     },
+    /// Server → client: the displays/monitors the server can capture.
+    /// Empty or single-entry when the active backend cannot enumerate outputs
+    /// (e.g. the XDG portal fallback path).
+    AvailableOutputs(Vec<OutputInfo>),
+    /// Client → server: select which output (by `OutputInfo::id`) to capture.
+    /// Reconfigures the shared stream for all clients.
+    SelectOutput(u32),
 }
 
 impl ControlMessage {
@@ -701,6 +777,8 @@ impl ControlMessage {
     const TYPE_FILE_COMPLETE: u8 = 25;
     const TYPE_FILE_CANCEL: u8 = 26;
     const TYPE_FILE_PROGRESS: u8 = 27;
+    const TYPE_AVAILABLE_OUTPUTS: u8 = 28;
+    const TYPE_SELECT_OUTPUT: u8 = 29;
 
     /// Serialize this message into a byte vector (header + payload).
     pub fn serialize(&self) -> Vec<u8> {
@@ -957,6 +1035,28 @@ impl ControlMessage {
                 buf[p + 4..p + 8].copy_from_slice(&chunks_received.to_be_bytes());
                 buf
             }
+            ControlMessage::AvailableOutputs(outputs) => {
+                let count = outputs.len().min(u16::MAX as usize);
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&(count as u16).to_be_bytes());
+                for out in outputs.iter().take(count) {
+                    out.write_into(&mut payload);
+                }
+                let len = payload.len().min(MAX_CONTROL_PAYLOAD);
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + len];
+                buf[0] = Self::TYPE_AVAILABLE_OUTPUTS;
+                buf[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+                buf[CONTROL_HEADER_SIZE..CONTROL_HEADER_SIZE + len]
+                    .copy_from_slice(&payload[..len]);
+                buf
+            }
+            ControlMessage::SelectOutput(id) => {
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + 4];
+                buf[0] = Self::TYPE_SELECT_OUTPUT;
+                buf[1..3].copy_from_slice(&4u16.to_be_bytes());
+                buf[CONTROL_HEADER_SIZE..CONTROL_HEADER_SIZE + 4].copy_from_slice(&id.to_be_bytes());
+                buf
+            }
         }
     }
 
@@ -1095,6 +1195,25 @@ impl ControlMessage {
                 let chunks_received = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 ControlMessage::FileProgress { transfer_id, chunks_received }
             }
+            Self::TYPE_AVAILABLE_OUTPUTS => {
+                if payload.len() < 2 {
+                    return None;
+                }
+                let count = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                let mut pos = 2usize;
+                let mut outputs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    outputs.push(OutputInfo::read_from(payload, &mut pos)?);
+                }
+                ControlMessage::AvailableOutputs(outputs)
+            }
+            Self::TYPE_SELECT_OUTPUT => {
+                if payload.len() < 4 {
+                    return None;
+                }
+                let id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                ControlMessage::SelectOutput(id)
+            }
             _ => return None,
         };
 
@@ -1149,6 +1268,73 @@ mod tests {
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, ControlMessage::Shutdown);
         assert_eq!(consumed, CONTROL_HEADER_SIZE);
+    }
+
+    #[test]
+    fn roundtrip_available_outputs() {
+        let msg = ControlMessage::AvailableOutputs(vec![
+            OutputInfo {
+                id: 1,
+                name: "DP-1".to_string(),
+                width: 3840,
+                height: 2160,
+                x: 0,
+                y: 0,
+                is_primary: true,
+            },
+            OutputInfo {
+                id: 2,
+                name: "HDMI-A-2 (résumé 🖥)".to_string(),
+                width: 1920,
+                height: 1080,
+                x: 3840,
+                y: 120,
+                is_primary: false,
+            },
+        ]);
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_available_outputs_empty() {
+        let msg = ControlMessage::AvailableOutputs(Vec::new());
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_select_output() {
+        let msg = ControlMessage::SelectOutput(0xDEAD_BEEF);
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn available_outputs_truncates_long_name() {
+        let long = "x".repeat(1000);
+        let msg = ControlMessage::AvailableOutputs(vec![OutputInfo {
+            id: 7,
+            name: long,
+            width: 100,
+            height: 100,
+            x: 0,
+            y: 0,
+            is_primary: false,
+        }]);
+        let buf = msg.serialize();
+        let (decoded, _) = ControlMessage::deserialize(&buf).unwrap();
+        if let ControlMessage::AvailableOutputs(outs) = decoded {
+            assert_eq!(outs[0].name.len(), OutputInfo::MAX_NAME_LEN);
+        } else {
+            panic!("wrong variant");
+        }
     }
 
     #[test]
