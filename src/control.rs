@@ -8,17 +8,25 @@ pub const MAX_CONTROL_PAYLOAD: usize = u16::MAX as usize;
 /// Control message header size: 1 byte type + 2 bytes length.
 pub const CONTROL_HEADER_SIZE: usize = 3;
 
-/// Fixed-size payload for stream configuration.
-const STREAM_CONFIG_PAYLOAD_SIZE: usize = 18;
+/// Fixed-size payload for stream configuration. 19 bytes once `packet_duration_ms`
+/// (E1) is appended; legacy 17/18-byte payloads stay decodable.
+const STREAM_CONFIG_PAYLOAD_SIZE: usize = 19;
 /// Fixed-size payload for client display refresh hints, client UDP receive
-/// port, and advertised video codec support.
-const CLIENT_DISPLAY_INFO_PAYLOAD_SIZE: usize = 8;
+/// port, advertised video codec support, and the HDR-display flag (D2). Legacy
+/// 4/6/8-byte payloads stay decodable.
+const CLIENT_DISPLAY_INFO_PAYLOAD_SIZE: usize = 9;
 /// Fixed-size payload for client clock-sync pings.
 const CLOCK_SYNC_PING_PAYLOAD_SIZE: usize = 8;
 /// Fixed-size payload for server clock-sync pongs.
 const CLOCK_SYNC_PONG_PAYLOAD_SIZE: usize = 28;
-/// Fixed-size payload for periodic client transport feedback.
-const TRANSPORT_FEEDBACK_PAYLOAD_SIZE: usize = 24;
+/// Fixed-size payload for periodic client transport feedback. Legacy peers send
+/// only the first 24 bytes (the six counters); the extra 20 carry the
+/// lost-frame range + RTT/OWD/recv-kbps congestion signals (A/B).
+const TRANSPORT_FEEDBACK_PAYLOAD_SIZE: usize = 44;
+/// Legacy transport-feedback payload size without the congestion-control fields.
+const TRANSPORT_FEEDBACK_LEGACY_SIZE: usize = 24;
+/// Fixed-size payload for the client bitrate-preference handshake (B4).
+const CLIENT_BITRATE_PREFERENCE_PAYLOAD_SIZE: usize = 4;
 /// Fixed-size payload for per-client input session ids.
 const INPUT_SESSION_PAYLOAD_SIZE: usize = 4;
 /// Fixed-size payload for controller ownership state.
@@ -147,9 +155,16 @@ pub struct StreamConfig {
     pub audio_channels: u8,
     pub hdr: bool,
     pub chroma: VideoChromaSampling,
+    /// Opus frame duration in ms (E1). The client must derive its audio
+    /// sequence-gap math from this rather than hardcoding 20 ms. Defaults to
+    /// 20 ms when decoded from a legacy (≤18-byte) payload.
+    pub packet_duration_ms: u8,
 }
 
 impl StreamConfig {
+    /// Default Opus frame duration when a peer omits the field.
+    const DEFAULT_PACKET_DURATION_MS: u8 = 20;
+
     fn serialize(&self) -> [u8; STREAM_CONFIG_PAYLOAD_SIZE] {
         let mut buf = [0u8; STREAM_CONFIG_PAYLOAD_SIZE];
         buf[0] = self.codec.to_u8();
@@ -160,13 +175,28 @@ impl StreamConfig {
         buf[12..16].copy_from_slice(&self.audio_sample_rate.to_be_bytes());
         buf[16] = self.audio_channels;
         buf[17] = self.chroma.to_u8();
+        buf[18] = self.packet_duration_ms;
         buf
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
-        let chroma = match buf.len() {
-            STREAM_CONFIG_PAYLOAD_SIZE => VideoChromaSampling::from_u8(buf[17])?,
-            17 => VideoChromaSampling::Yuv420,
+        let (chroma, packet_duration_ms) = match buf.len() {
+            STREAM_CONFIG_PAYLOAD_SIZE => (
+                VideoChromaSampling::from_u8(buf[17])?,
+                if buf[18] == 0 {
+                    Self::DEFAULT_PACKET_DURATION_MS
+                } else {
+                    buf[18]
+                },
+            ),
+            18 => (
+                VideoChromaSampling::from_u8(buf[17])?,
+                Self::DEFAULT_PACKET_DURATION_MS,
+            ),
+            17 => (
+                VideoChromaSampling::Yuv420,
+                Self::DEFAULT_PACKET_DURATION_MS,
+            ),
             _ => return None,
         };
 
@@ -179,6 +209,7 @@ impl StreamConfig {
             audio_sample_rate: u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
             audio_channels: buf[16],
             chroma,
+            packet_duration_ms,
         })
     }
 }
@@ -191,9 +222,14 @@ pub struct ClientDisplayInfo {
     pub hardware_video_codecs: VideoCodecSupport,
     pub supported_yuv444_video_codecs: VideoCodecSupport,
     pub hardware_yuv444_video_codecs: VideoCodecSupport,
+    /// The client's display can present HDR (D2). The server AND-gates HDR on
+    /// this so a non-HDR client never gets a washed-out BT.2020+PQ stream.
+    pub hdr_display: bool,
 }
 
 impl ClientDisplayInfo {
+    const HDR_DISPLAY_BIT: u8 = 1 << 0;
+
     fn serialize(&self) -> [u8; CLIENT_DISPLAY_INFO_PAYLOAD_SIZE] {
         let mut buf = [0u8; CLIENT_DISPLAY_INFO_PAYLOAD_SIZE];
         buf[0..4].copy_from_slice(&self.max_refresh_millihz.to_be_bytes());
@@ -202,6 +238,11 @@ impl ClientDisplayInfo {
             | (self.supported_yuv444_video_codecs.serialize() << 3);
         buf[7] = self.hardware_video_codecs.serialize()
             | (self.hardware_yuv444_video_codecs.serialize() << 3);
+        buf[8] = if self.hdr_display {
+            Self::HDR_DISPLAY_BIT
+        } else {
+            0
+        };
         buf
     }
 
@@ -215,14 +256,18 @@ impl ClientDisplayInfo {
                 hardware_video_codecs: VideoCodecSupport::empty(),
                 supported_yuv444_video_codecs: VideoCodecSupport::empty(),
                 hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hdr_display: false,
             }),
-            CLIENT_DISPLAY_INFO_PAYLOAD_SIZE => Some(Self {
+            // 8 = legacy codec-capable payload without the HDR-display flag.
+            8 | CLIENT_DISPLAY_INFO_PAYLOAD_SIZE => Some(Self {
                 max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
                 udp_port: u16::from_be_bytes([buf[4], buf[5]]),
                 supported_video_codecs: VideoCodecSupport::deserialize(buf[6]),
                 hardware_video_codecs: VideoCodecSupport::deserialize(buf[7]),
                 supported_yuv444_video_codecs: VideoCodecSupport::deserialize(buf[6] >> 3),
                 hardware_yuv444_video_codecs: VideoCodecSupport::deserialize(buf[7] >> 3),
+                hdr_display: buf.len() >= CLIENT_DISPLAY_INFO_PAYLOAD_SIZE
+                    && (buf[8] & Self::HDR_DISPLAY_BIT != 0),
             }),
             6 => Some(Self {
                 max_refresh_millihz: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
@@ -231,6 +276,7 @@ impl ClientDisplayInfo {
                 hardware_video_codecs: VideoCodecSupport::empty(),
                 supported_yuv444_video_codecs: VideoCodecSupport::empty(),
                 hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hdr_display: false,
             }),
             _ => None,
         }
@@ -364,6 +410,17 @@ pub struct TransportFeedback {
     pub late_packets: u32,
     pub completed_frames: u32,
     pub dropped_frames: u32,
+    /// First/last frame id in the most recent contiguous lost-frame range, used
+    /// by the server to pick a targeted recovery tier (A). `(0, 0)` = none.
+    pub lost_frame_first: u32,
+    pub lost_frame_last: u32,
+    /// Smoothed round-trip time in ms (0 = unknown).
+    pub rtt_ms: u32,
+    /// One-way-delay trend over the window in microseconds: a sustained positive
+    /// value means the bottleneck queue is building (pre-loss congestion, B1).
+    pub owd_trend_us: i32,
+    /// Measured received video throughput in kbps over the window (B1 clamp).
+    pub recv_video_kbps: u32,
 }
 
 impl TransportFeedback {
@@ -375,21 +432,36 @@ impl TransportFeedback {
         buf[12..16].copy_from_slice(&self.late_packets.to_be_bytes());
         buf[16..20].copy_from_slice(&self.completed_frames.to_be_bytes());
         buf[20..24].copy_from_slice(&self.dropped_frames.to_be_bytes());
+        buf[24..28].copy_from_slice(&self.lost_frame_first.to_be_bytes());
+        buf[28..32].copy_from_slice(&self.lost_frame_last.to_be_bytes());
+        buf[32..36].copy_from_slice(&self.rtt_ms.to_be_bytes());
+        buf[36..40].copy_from_slice(&self.owd_trend_us.to_be_bytes());
+        buf[40..44].copy_from_slice(&self.recv_video_kbps.to_be_bytes());
         buf
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() != TRANSPORT_FEEDBACK_PAYLOAD_SIZE {
+        // Length-tolerant: a legacy peer sends only the first 24 bytes.
+        if buf.len() != TRANSPORT_FEEDBACK_PAYLOAD_SIZE
+            && buf.len() != TRANSPORT_FEEDBACK_LEGACY_SIZE
+        {
             return None;
         }
 
+        let read_u32 = |o: usize| u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let has_cc = buf.len() >= TRANSPORT_FEEDBACK_PAYLOAD_SIZE;
         Some(Self {
-            interval_ms: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            received_packets: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            lost_packets: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            late_packets: u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            completed_frames: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            dropped_frames: u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]),
+            interval_ms: read_u32(0),
+            received_packets: read_u32(4),
+            lost_packets: read_u32(8),
+            late_packets: read_u32(12),
+            completed_frames: read_u32(16),
+            dropped_frames: read_u32(20),
+            lost_frame_first: if has_cc { read_u32(24) } else { 0 },
+            lost_frame_last: if has_cc { read_u32(28) } else { 0 },
+            rtt_ms: if has_cc { read_u32(32) } else { 0 },
+            owd_trend_us: if has_cc { read_u32(36) as i32 } else { 0 },
+            recv_video_kbps: if has_cc { read_u32(40) } else { 0 },
         })
     }
 }
@@ -739,6 +811,10 @@ pub enum ControlMessage {
     /// Client → server: select which output (by `OutputInfo::id`) to capture.
     /// Reconfigures the shared stream for all clients.
     SelectOutput(u32),
+    /// Client → server: declared maximum bitrate ceiling in kbps, sent right
+    /// after `Authenticate` (B4). Seeds the ABR ceiling so the prober doesn't
+    /// overshoot a known-thin link before the first loss.
+    ClientBitratePreference(u32),
 }
 
 impl ControlMessage {
@@ -772,6 +848,7 @@ impl ControlMessage {
     const TYPE_FILE_PROGRESS: u8 = 27;
     const TYPE_AVAILABLE_OUTPUTS: u8 = 28;
     const TYPE_SELECT_OUTPUT: u8 = 29;
+    const TYPE_CLIENT_BITRATE_PREFERENCE: u8 = 30;
 
     /// Serialize this message into a byte vector (header + payload).
     pub fn serialize(&self) -> Vec<u8> {
@@ -1051,6 +1128,18 @@ impl ControlMessage {
                     .copy_from_slice(&id.to_be_bytes());
                 buf
             }
+            ControlMessage::ClientBitratePreference(max_kbps) => {
+                let mut buf =
+                    vec![0u8; CONTROL_HEADER_SIZE + CLIENT_BITRATE_PREFERENCE_PAYLOAD_SIZE];
+                buf[0] = Self::TYPE_CLIENT_BITRATE_PREFERENCE;
+                buf[1..3].copy_from_slice(
+                    &(CLIENT_BITRATE_PREFERENCE_PAYLOAD_SIZE as u16).to_be_bytes(),
+                );
+                buf[CONTROL_HEADER_SIZE
+                    ..CONTROL_HEADER_SIZE + CLIENT_BITRATE_PREFERENCE_PAYLOAD_SIZE]
+                    .copy_from_slice(&max_kbps.to_be_bytes());
+                buf
+            }
         }
     }
 
@@ -1241,6 +1330,13 @@ impl ControlMessage {
                 let id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 ControlMessage::SelectOutput(id)
             }
+            Self::TYPE_CLIENT_BITRATE_PREFERENCE => {
+                if payload.len() < CLIENT_BITRATE_PREFERENCE_PAYLOAD_SIZE {
+                    return None;
+                }
+                let max_kbps = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                ControlMessage::ClientBitratePreference(max_kbps)
+            }
             _ => return None,
         };
 
@@ -1263,11 +1359,85 @@ mod tests {
             audio_channels: 2,
             hdr: true,
             chroma: VideoChromaSampling::Yuv444,
+            packet_duration_ms: 5,
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, msg);
         assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn stream_config_legacy_lengths_default_packet_duration() {
+        // 18-byte legacy payload (chroma present, no packet_duration) → 20 ms.
+        let full = StreamConfig {
+            codec: VideoCodec::Hevc,
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
+            hdr: false,
+            chroma: VideoChromaSampling::Yuv420,
+            packet_duration_ms: 5,
+        };
+        let buf = full.serialize();
+        let legacy = StreamConfig::deserialize(&buf[..18]).unwrap();
+        assert_eq!(legacy.packet_duration_ms, 20);
+        assert_eq!(legacy.chroma, VideoChromaSampling::Yuv420);
+    }
+
+    #[test]
+    fn roundtrip_transport_feedback_cc_fields() {
+        let fb = TransportFeedback {
+            interval_ms: 500,
+            received_packets: 1000,
+            lost_packets: 12,
+            late_packets: 3,
+            completed_frames: 60,
+            dropped_frames: 1,
+            lost_frame_first: 4242,
+            lost_frame_last: 4244,
+            rtt_ms: 27,
+            owd_trend_us: -1500,
+            recv_video_kbps: 18_500,
+        };
+        let msg = ControlMessage::TransportFeedback(fb);
+        let buf = msg.serialize();
+        let (decoded, _) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        // Legacy 24-byte payload decodes with CC fields zeroed.
+        let legacy = TransportFeedback::deserialize(&fb.serialize()[..24]).unwrap();
+        assert_eq!(legacy.lost_frame_first, 0);
+        assert_eq!(legacy.rtt_ms, 0);
+        assert_eq!(legacy.received_packets, 1000);
+    }
+
+    #[test]
+    fn roundtrip_client_bitrate_preference() {
+        let msg = ControlMessage::ClientBitratePreference(35_000);
+        let buf = msg.serialize();
+        let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn roundtrip_client_display_info_hdr() {
+        let mut info = ClientDisplayInfo {
+            max_refresh_millihz: 144_000,
+            udp_port: 5000,
+            hdr_display: true,
+            ..Default::default()
+        };
+        info.supported_video_codecs.insert(VideoCodec::H264);
+        let msg = ControlMessage::ClientDisplayInfo(info);
+        let buf = msg.serialize();
+        let (decoded, _) = ControlMessage::deserialize(&buf).unwrap();
+        assert_eq!(decoded, msg);
+        // 8-byte legacy payload → hdr_display defaults false.
+        let legacy = ClientDisplayInfo::deserialize(&info.serialize()[..8]).unwrap();
+        assert!(!legacy.hdr_display);
     }
 
     #[test]
@@ -1373,6 +1543,7 @@ mod tests {
             hardware_video_codecs: VideoCodecSupport::h264_only(),
             supported_yuv444_video_codecs: VideoCodecSupport::all(),
             hardware_yuv444_video_codecs: VideoCodecSupport::h264_only(),
+            hdr_display: true,
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
@@ -1397,6 +1568,7 @@ mod tests {
                 hardware_video_codecs: VideoCodecSupport::empty(),
                 supported_yuv444_video_codecs: VideoCodecSupport::empty(),
                 hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hdr_display: false,
             })
         );
         assert_eq!(consumed, buf.len());
@@ -1420,6 +1592,7 @@ mod tests {
                 hardware_video_codecs: VideoCodecSupport::empty(),
                 supported_yuv444_video_codecs: VideoCodecSupport::empty(),
                 hardware_yuv444_video_codecs: VideoCodecSupport::empty(),
+                hdr_display: false,
             })
         );
         assert_eq!(consumed, buf.len());
@@ -1450,6 +1623,7 @@ mod tests {
                 audio_channels: 2,
                 hdr: true,
                 chroma: VideoChromaSampling::Yuv420,
+                packet_duration_ms: 20,
             })
         );
         assert_eq!(consumed, buf.len());
@@ -1512,6 +1686,7 @@ mod tests {
             late_packets: 3,
             completed_frames: 58,
             dropped_frames: 2,
+            ..Default::default()
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();

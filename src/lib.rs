@@ -17,7 +17,7 @@ pub use control::{
     TransportFeedback, VideoChromaSampling, VideoCodec, VideoCodecSupport,
 };
 pub use frame_assembler::{CompletedFrame, FrameAssembler};
-pub use frame_slicer::FrameSlicer;
+pub use frame_slicer::{FecConfig, FrameSlicer};
 pub use input::{
     InputPacket, KeyboardKey, KeyboardStateInput, MouseAbsoluteInput, MouseButtonsInput,
     MouseRelativeInput, MouseWheelInput, KEYBOARD_STATE_BYTES, MOUSE_BUTTON_EXTRA1,

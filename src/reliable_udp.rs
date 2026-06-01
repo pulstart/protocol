@@ -86,11 +86,19 @@ fn configure_punched_socket(socket: &UdpSocket, peer: SocketAddr) {
         let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_SNDBUF, send_buf);
         let _ = set_socket_int_opt(socket, libc::SOL_SOCKET, libc::SO_RCVBUF, recv_buf);
 
-        if let Some(dscp) = std::env::var("ST_UDP_DSCP")
-            .ok()
-            .and_then(|raw| raw.parse::<u8>().ok())
-            .filter(|value| *value <= 63)
-        {
+        // Media DSCP is default-on (CS5 = 40) per the auto-enable rule, mirroring
+        // the direct-socket path. `ST_UDP_DSCP=off|0|false|no` disables it.
+        let dscp = match std::env::var("ST_UDP_DSCP") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "off" | "0" | "false" | "no" => None,
+                    _ => trimmed.parse::<u8>().ok().filter(|value| *value <= 63),
+                }
+            }
+            Err(_) => Some(40u8),
+        };
+        if let Some(dscp) = dscp {
             let tos = i32::from(dscp) << 2;
             let (level, optname) = match peer.ip() {
                 std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
