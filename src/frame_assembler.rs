@@ -92,7 +92,17 @@ impl FrameAssembler {
             // age >= 0x8000_0000 means header.frame_id is behind last_completed
             // (or equal when age == 0).
             if age == 0 || age >= 0x8000_0000 {
-                outcome.feedback.late_packets = 1;
+                // Only genuine media `Data` stragglers count as "late" (network
+                // reordering). Parity packets and the delayed-duplicate FrameStart
+                // are deliberate redundancy (FEC) that routinely arrives after a
+                // frame has already completed from its data packets — every healthy
+                // multi-packet frame produces at least one. Counting that baseline
+                // as "late" made a clean FEC stream look permanently impaired, so
+                // the ABR controller's clean-interval counter never accumulated and
+                // it stayed pinned at the bitrate floor.
+                if header.payload_type == PayloadType::Data {
+                    outcome.feedback.late_packets = 1;
+                }
                 return outcome;
             }
         }
@@ -489,6 +499,65 @@ mod tests {
         // Now try to feed frame 3 — should be discarded
         let old_packets = slicer.slice(&[4, 5, 6], 3).to_vec();
         assert!(assembler.ingest(&old_packets[0]).is_none());
+    }
+
+    #[test]
+    fn redundancy_packets_after_completion_are_not_counted_late() {
+        // Regression guard: the protocol deliberately sends FEC parity and a
+        // delayed-duplicate FrameStart for every multi-packet frame. Those
+        // routinely arrive after the frame already completed. They must NOT be
+        // reported as `late_packets`, or a clean FEC stream looks permanently
+        // impaired and the ABR controller stays pinned at its floor.
+        use crate::frame_slicer::{FecConfig, FrameSlicer};
+        use crate::packet::{frame_type, FecMode};
+        use crate::FrameTimingMeta;
+
+        let mut slicer = FrameSlicer::with_config(
+            600,
+            FecConfig {
+                mode: FecMode::Rs,
+                fec_pct: 0,
+                min_parity: 1,
+            },
+        );
+        let payload = vec![0x5Au8; 6_000];
+        let (data, parity) =
+            slicer.slice_with_meta_parts(&payload, 1, FrameTimingMeta::default(), frame_type::IDR);
+        let data = data.to_vec();
+        let parity = parity.to_vec();
+        assert!(data.len() > 1, "payload must be multi-packet");
+        assert_eq!(parity.len(), 1, "floor-0 RS emits one parity packet");
+
+        let mut asm = FrameAssembler::new();
+        let mut completed = false;
+        for pkt in &data {
+            if asm.ingest(pkt).is_some() {
+                completed = true;
+            }
+        }
+        assert!(completed, "frame must complete from its data packets");
+
+        // Parity for the already-completed frame: redundancy, not lateness.
+        let parity_outcome = asm.ingest_with_feedback(&parity[0]);
+        assert_eq!(
+            parity_outcome.feedback.late_packets, 0,
+            "late parity is expected FEC redundancy, must not count as late"
+        );
+
+        // A duplicate FrameStart (the deliberate delayed copy) after completion
+        // is likewise not "late".
+        let dup_start_outcome = asm.ingest_with_feedback(&data[0]);
+        assert_eq!(
+            dup_start_outcome.feedback.late_packets, 0,
+            "duplicate FrameStart is expected redundancy, must not count as late"
+        );
+
+        // A genuine Data straggler for the completed frame IS late (real reorder).
+        let straggler = asm.ingest_with_feedback(&data[1]);
+        assert_eq!(
+            straggler.feedback.late_packets, 1,
+            "a late media Data packet is genuine reordering and must count"
+        );
     }
 
     #[test]
