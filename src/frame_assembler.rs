@@ -11,8 +11,8 @@ pub struct CompletedFrame {
     pub timing: FrameTimingMeta,
     /// Frame type from the FrameStart header (see [`crate::packet::frame_type`]).
     /// Lets the client recovery state machine key off an explicit marker instead
-    /// of trial-decoding. Defaults to `P` when the FrameStart was recovered via
-    /// parity (no header) or sent by a legacy peer.
+    /// of trial-decoding. Defaults to `P` when the FrameStart packet was lost and
+    /// the frame was recovered via parity (no header bytes to read it from).
     pub frame_type: u8,
 }
 

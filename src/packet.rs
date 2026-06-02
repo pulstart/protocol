@@ -4,17 +4,11 @@ pub const MAX_UDP: usize = 1400;
 pub const MAX_PAYLOAD: usize = MAX_UDP - HEADER_SIZE; // 1393
 /// FrameStart meta: total_packets(2) + capture_ts(8) + send_ts(8) + frame_type(1).
 pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8 + 1;
-/// Minimum legacy FrameStart meta without the trailing `frame_type` byte. Kept
-/// so `FrameTimingMeta::deserialize` stays length-tolerant.
-const FRAME_START_HEADER_MIN: usize = 2 + 8 + 8;
 /// Parity meta: start_seq(2) total_packets(2) chunk_bytes_sum(4) capture_ts(8)
 /// send_ts(8) + RS extension data_shards(2) parity_shards(2) shard_index(2)
 /// shard_len(2) frame_type(1). `parity_shards == 0` is the single-XOR degenerate
 /// case (A1); any positive value selects Reed-Solomon block recovery.
 pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8 + 2 + 2 + 2 + 2 + 1;
-/// Legacy XOR-only parity meta size (pre-A1) without the RS extension. Kept so
-/// `FrameParityMeta::deserialize` stays length-tolerant against an old peer.
-const FRAME_PARITY_HEADER_MIN: usize = 2 + 2 + 4 + 8 + 8;
 
 /// FEC scheme for a video unit's parity packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,9 +43,9 @@ pub mod frame_type {
     /// recovery on it the same as on an IDR.
     pub const RECOVERY: u8 = 5;
 
-    /// Map the legacy server-side `is_recovery` (== keyframe) bool to a wire
-    /// frame type. Today every recovery is a full IDR, so a keyframe is tagged
-    /// IDR; non-keyframes are P.
+    /// Map the server-side `is_recovery` (== keyframe) bool to a wire frame
+    /// type. Today every recovery is a full IDR, so a keyframe is tagged IDR;
+    /// non-keyframes are P.
     pub const fn from_is_recovery(is_recovery: bool) -> u8 {
         if is_recovery {
             IDR
@@ -162,10 +156,10 @@ impl FrameTimingMeta {
     }
 
     /// Deserialize the FrameStart meta. Returns `(total_packets, frame_type,
-    /// timing)`. Length-tolerant: a legacy 18-byte header (no `frame_type`)
-    /// defaults the type to [`frame_type::P`].
+    /// timing)`. `buf` is the packet payload, which carries frame data after the
+    /// meta, so only the leading header bytes are read.
     pub fn deserialize(buf: &[u8]) -> Option<(u16, u8, Self)> {
-        if buf.len() < FRAME_START_HEADER_MIN {
+        if buf.len() < FRAME_START_HEADER_SIZE {
             return None;
         }
         let total_packets = u16::from_be_bytes([buf[0], buf[1]]);
@@ -175,14 +169,9 @@ impl FrameTimingMeta {
         let send_ts_micros = u64::from_be_bytes([
             buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
         ]);
-        let ftype = if buf.len() >= FRAME_START_HEADER_SIZE {
-            buf[18]
-        } else {
-            frame_type::P
-        };
         Some((
             total_packets,
-            ftype,
+            buf[18],
             Self {
                 capture_ts_micros,
                 send_ts_micros,
@@ -237,7 +226,7 @@ impl FrameParityMeta {
     }
 
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() < FRAME_PARITY_HEADER_MIN {
+        if buf.len() < FRAME_PARITY_HEADER_SIZE {
             return None;
         }
         let timing = FrameTimingMeta {
@@ -248,29 +237,16 @@ impl FrameParityMeta {
                 buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
             ]),
         };
-        // Length-tolerant: a legacy 24-byte XOR header has no RS extension.
-        let (data_shards, parity_shards, shard_index, shard_len, frame_type) =
-            if buf.len() >= FRAME_PARITY_HEADER_SIZE {
-                (
-                    u16::from_be_bytes([buf[24], buf[25]]),
-                    u16::from_be_bytes([buf[26], buf[27]]),
-                    u16::from_be_bytes([buf[28], buf[29]]),
-                    u16::from_be_bytes([buf[30], buf[31]]),
-                    buf[32],
-                )
-            } else {
-                (0, 0, 0, 0, frame_type::P)
-            };
         Some(Self {
             start_seq: u16::from_be_bytes([buf[0], buf[1]]),
             total_packets: u16::from_be_bytes([buf[2], buf[3]]),
             chunk_bytes_sum: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
             timing,
-            data_shards,
-            parity_shards,
-            shard_index,
-            shard_len,
-            frame_type,
+            data_shards: u16::from_be_bytes([buf[24], buf[25]]),
+            parity_shards: u16::from_be_bytes([buf[26], buf[27]]),
+            shard_index: u16::from_be_bytes([buf[28], buf[29]]),
+            shard_len: u16::from_be_bytes([buf[30], buf[31]]),
+            frame_type: buf[32],
         })
     }
 }
@@ -390,12 +366,8 @@ mod tests {
         assert_eq!(ftype, frame_type::IDR);
         assert_eq!(decoded, meta);
 
-        // Length-tolerant: a legacy 18-byte header defaults frame_type to P.
-        let (lt_total, lt_ftype, lt_decoded) =
-            FrameTimingMeta::deserialize(&buf[..FRAME_START_HEADER_SIZE - 1]).unwrap();
-        assert_eq!(lt_total, 7);
-        assert_eq!(lt_ftype, frame_type::P);
-        assert_eq!(lt_decoded, meta);
+        // A header shorter than the full meta is rejected.
+        assert!(FrameTimingMeta::deserialize(&buf[..FRAME_START_HEADER_SIZE - 1]).is_none());
     }
 
     #[test]
@@ -439,11 +411,8 @@ mod tests {
         assert_eq!(decoded, meta);
         assert!(decoded.is_rs());
 
-        // Length-tolerant: a legacy 24-byte XOR header parses with no RS fields.
-        let legacy = FrameParityMeta::deserialize(&buf[..FRAME_PARITY_HEADER_MIN]).unwrap();
-        assert!(!legacy.is_rs());
-        assert_eq!(legacy.start_seq, 91);
-        assert_eq!(legacy.total_packets, 7);
+        // A header shorter than the full meta is rejected.
+        assert!(FrameParityMeta::deserialize(&buf[..FRAME_PARITY_HEADER_SIZE - 1]).is_none());
     }
 
     #[test]
