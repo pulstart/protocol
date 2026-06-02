@@ -433,6 +433,12 @@ pub struct InputCapabilities {
     pub keyboard: bool,
     pub separate_cursor: bool,
     pub hover_capture: bool,
+    /// The server's reported `CursorState{x,y}` reflects the true on-screen
+    /// cursor position (x11 XFixes, PipeWire SPA_META_Cursor). False when the
+    /// backend exposes a separate cursor image but no usable position (KMS: the
+    /// legacy cursor plane reports (0,0) on NVIDIA). The client uses this to
+    /// avoid re-anchoring a relative-capture cursor to a bogus (0,0) on idle.
+    pub cursor_position_reliable: bool,
 }
 
 impl InputCapabilities {
@@ -441,6 +447,7 @@ impl InputCapabilities {
     const KEYBOARD_BIT: u8 = 1 << 2;
     const SEPARATE_CURSOR_BIT: u8 = 1 << 3;
     const HOVER_CAPTURE_BIT: u8 = 1 << 4;
+    const CURSOR_POSITION_RELIABLE_BIT: u8 = 1 << 5;
 
     fn serialize(&self) -> [u8; INPUT_CAPABILITIES_PAYLOAD_SIZE] {
         let mut flags = 0u8;
@@ -459,6 +466,9 @@ impl InputCapabilities {
         if self.hover_capture {
             flags |= Self::HOVER_CAPTURE_BIT;
         }
+        if self.cursor_position_reliable {
+            flags |= Self::CURSOR_POSITION_RELIABLE_BIT;
+        }
         [flags]
     }
 
@@ -474,6 +484,7 @@ impl InputCapabilities {
             keyboard: flags & Self::KEYBOARD_BIT != 0,
             separate_cursor: flags & Self::SEPARATE_CURSOR_BIT != 0,
             hover_capture: flags & Self::HOVER_CAPTURE_BIT != 0,
+            cursor_position_reliable: flags & Self::CURSOR_POSITION_RELIABLE_BIT != 0,
         })
     }
 }
@@ -1606,6 +1617,7 @@ mod tests {
             keyboard: true,
             separate_cursor: false,
             hover_capture: true,
+            cursor_position_reliable: true,
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
