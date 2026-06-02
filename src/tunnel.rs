@@ -267,33 +267,36 @@ const STUN_SERVERS: &[&str] = &[
     "stun1.l.google.com:19302",
 ];
 
-/// Send one STUN Binding Request and parse the XOR-MAPPED-ADDRESS.
-/// `local_socket` must already be bound; the response is received on the
-/// same socket so the NAT mapping is consistent with subsequent hole-punch
-/// probes from that socket.
-fn stun_query_one(local_socket: &UdpSocket, server: &str) -> Option<SocketAddr> {
-    // Header: type(2) + length(2) + magic_cookie(4) + transaction_id(12) = 20 bytes.
+/// Overall bound for a full multi-server STUN sweep. The sweep is concurrent on
+/// one socket (send all, then collect by transaction id), so this caps the worst
+/// case at ~1.5s instead of `servers × 2s` serial — the old behaviour stalled
+/// the connect path for up to 6s when STUN servers were slow/blocked.
+const STUN_TOTAL_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Retransmit still-unanswered requests once at this point (cheap loss recovery
+/// — a single dropped reply previously cost a full per-server timeout).
+const STUN_RETRANSMIT_AT: Duration = Duration::from_millis(600);
+
+/// Build a STUN Binding Request carrying `tx_id`.
+fn stun_request_bytes(tx_id: &[u8; 12]) -> [u8; 20] {
+    // Header: type(2) + length(2) + magic_cookie(4) + transaction_id(12).
     let mut request = [0u8; 20];
-    request[0] = 0x00;
-    request[1] = 0x01;
-    request[2] = 0x00;
-    request[3] = 0x00;
+    request[1] = 0x01; // Binding Request (0x0001), length stays 0
     request[4] = 0x21;
     request[5] = 0x12;
     request[6] = 0xA4;
     request[7] = 0x42;
-    let tx_id: [u8; 12] = rand::random();
-    request[8..20].copy_from_slice(&tx_id);
+    request[8..20].copy_from_slice(tx_id);
+    request
+}
 
-    let addr: SocketAddr = server.to_socket_addrs().ok()?.next()?;
-    local_socket.send_to(&request, addr).ok()?;
-
-    let mut buf = [0u8; 256];
-    let n = local_socket.recv_from(&mut buf).ok()?.0;
-    if n < 20 || buf[0] != 0x01 || buf[1] != 0x01 || buf[8..20] != tx_id {
+/// Parse the (XOR-)MAPPED-ADDRESS from a STUN Binding Response, validating the
+/// transaction id. Handles IPv4 (family 0x01) and IPv6 (family 0x02), and both
+/// XOR-MAPPED-ADDRESS (0x0020) and legacy MAPPED-ADDRESS (0x0001).
+fn parse_stun_mapped_addr(buf: &[u8], expected_tx: &[u8; 12]) -> Option<SocketAddr> {
+    let n = buf.len();
+    if n < 20 || buf[0] != 0x01 || buf[1] != 0x01 || buf[8..20] != *expected_tx {
         return None;
     }
-
     let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
     let attr_end = (20 + msg_len).min(n);
     let mut pos = 20;
@@ -305,61 +308,117 @@ fn stun_query_one(local_socket: &UdpSocket, server: &str) -> Option<SocketAddr> 
         if attr_data_end > attr_end {
             break;
         }
-        if attr_type == 0x0020 && attr_len >= 8 && buf[attr_start + 1] == 0x01 {
-            let xor_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
-            let xor_ip = u32::from_be_bytes([
-                buf[attr_start + 4],
-                buf[attr_start + 5],
-                buf[attr_start + 6],
-                buf[attr_start + 7],
-            ]) ^ 0x2112A442;
-            let ip = std::net::Ipv4Addr::from(xor_ip);
-            return Some(SocketAddr::new(std::net::IpAddr::V4(ip), xor_port));
-        } else if attr_type == 0x0001 && attr_len >= 8 && buf[attr_start + 1] == 0x01 {
-            let port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]);
-            let ip = std::net::Ipv4Addr::new(
-                buf[attr_start + 4],
-                buf[attr_start + 5],
-                buf[attr_start + 6],
-                buf[attr_start + 7],
-            );
-            return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+        let xor = attr_type == 0x0020;
+        if (xor || attr_type == 0x0001) && attr_len >= 4 {
+            let family = buf[attr_start + 1];
+            let raw_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]);
+            let port = if xor { raw_port ^ 0x2112 } else { raw_port };
+            if family == 0x01 && attr_len >= 8 {
+                let raw_ip = u32::from_be_bytes([
+                    buf[attr_start + 4],
+                    buf[attr_start + 5],
+                    buf[attr_start + 6],
+                    buf[attr_start + 7],
+                ]);
+                let ip = std::net::Ipv4Addr::from(if xor { raw_ip ^ 0x2112A442 } else { raw_ip });
+                return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
+            } else if family == 0x02 && attr_len >= 20 {
+                let mut ip_bytes = [0u8; 16];
+                ip_bytes.copy_from_slice(&buf[attr_start + 4..attr_start + 20]);
+                if xor {
+                    // XOR key = magic cookie (4) || transaction id (12).
+                    let mut key = [0u8; 16];
+                    key[0] = 0x21;
+                    key[1] = 0x12;
+                    key[2] = 0xA4;
+                    key[3] = 0x42;
+                    key[4..16].copy_from_slice(expected_tx);
+                    for (b, k) in ip_bytes.iter_mut().zip(key.iter()) {
+                        *b ^= *k;
+                    }
+                }
+                let ip = std::net::Ipv6Addr::from(ip_bytes);
+                return Some(SocketAddr::new(std::net::IpAddr::V6(ip), port));
+            }
         }
         pos = attr_start + ((attr_len + 3) & !3);
     }
     None
 }
 
-/// Discover the public IP:port via STUN. Tries each configured server until
-/// one succeeds. Returns the first successful XOR-MAPPED-ADDRESS.
+/// Discover the public IP:port via STUN. Returns the first mapped address.
 pub fn stun_discover_public_addr(local_socket: &UdpSocket) -> Option<SocketAddr> {
-    let prev_timeout = local_socket.read_timeout().ok().flatten();
-    let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
-    let result = STUN_SERVERS
-        .iter()
-        .find_map(|s| stun_query_one(local_socket, s));
-    let _ = local_socket.set_read_timeout(prev_timeout);
-    result
+    stun_discover_all(local_socket).into_iter().next()
 }
 
-/// Query every configured STUN server from `local_socket` and return all
-/// distinct results, in query order. If the NAT is full/restricted-cone every
-/// query returns the same `ip:port`. If the NAT is symmetric the results
-/// differ by destination — that delta is what `predict_symmetric_candidates`
-/// later uses to guess the next port allocation for the peer.
+/// Query every configured STUN server concurrently on `local_socket` and return
+/// the distinct mapped addresses in server order. All requests go out first, then
+/// responses are collected (matched by transaction id) within `STUN_TOTAL_TIMEOUT`
+/// with one retransmit — bounding the sweep regardless of slow/blocked servers
+/// while keeping the single-socket NAT mapping consistent with later punching.
+/// Differing ports across servers indicate symmetric NAT (see
+/// `predict_symmetric_candidates`); cone NATs answer identically.
 pub fn stun_discover_all(local_socket: &UdpSocket) -> Vec<SocketAddr> {
+    struct Pending {
+        dst: SocketAddr,
+        tx: [u8; 12],
+        got: Option<SocketAddr>,
+    }
+
     let prev_timeout = local_socket.read_timeout().ok().flatten();
-    let _ = local_socket.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut out = Vec::new();
+    // Short recv slices so the retransmit/deadline checks get a turn.
+    let _ = local_socket.set_read_timeout(Some(Duration::from_millis(100)));
+
+    let mut pending: Vec<Pending> = Vec::new();
     for server in STUN_SERVERS {
-        if let Some(addr) = stun_query_one(local_socket, server) {
-            // Dedupe — cone NATs will give the same answer to all queries.
+        let Some(dst) = server.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+            continue;
+        };
+        let tx: [u8; 12] = rand::random();
+        let _ = local_socket.send_to(&stun_request_bytes(&tx), dst);
+        pending.push(Pending { dst, tx, got: None });
+    }
+
+    if !pending.is_empty() {
+        let start = Instant::now();
+        let deadline = start + STUN_TOTAL_TIMEOUT;
+        let mut retransmitted = false;
+        let mut buf = [0u8; 256];
+        while Instant::now() < deadline && pending.iter().any(|p| p.got.is_none()) {
+            if !retransmitted && start.elapsed() >= STUN_RETRANSMIT_AT {
+                retransmitted = true;
+                for p in pending.iter().filter(|p| p.got.is_none()) {
+                    let _ = local_socket.send_to(&stun_request_bytes(&p.tx), p.dst);
+                }
+            }
+            match local_socket.recv_from(&mut buf) {
+                Ok((n, _src)) => {
+                    for p in pending.iter_mut().filter(|p| p.got.is_none()) {
+                        if let Some(addr) = parse_stun_mapped_addr(&buf[..n], &p.tx) {
+                            p.got = Some(addr);
+                            break;
+                        }
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    let _ = local_socket.set_read_timeout(prev_timeout);
+
+    // Distinct results in server order (cone NATs dedupe to one entry).
+    let mut out = Vec::new();
+    for p in &pending {
+        if let Some(addr) = p.got {
             if !out.contains(&addr) {
                 out.push(addr);
             }
         }
     }
-    let _ = local_socket.set_read_timeout(prev_timeout);
     out
 }
 

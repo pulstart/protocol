@@ -27,6 +27,11 @@ const PORTMAP_GATEWAY_PORT: u16 = 5351;
 /// 500 ms is enough for any real LAN; a non-responsive gateway is treated
 /// as "doesn't support port mapping" so we move on quickly.
 const PORTMAP_TIMEOUT: Duration = Duration::from_millis(500);
+/// Total send attempts (1 original + retransmits) per mapping request. A single
+/// dropped reply previously failed the whole mapping for that cycle, so a
+/// symmetric-NAT peer could be left with no usable candidate at first connect;
+/// a couple of cheap retransmits recover transient UDP loss to the gateway.
+const PORTMAP_SEND_ATTEMPTS: u32 = 3;
 /// Lease we request from the gateway. Routers usually honor or downgrade
 /// (rarely upgrade) — we use whatever they grant.
 const REQUESTED_LIFETIME_SECS: u32 = 3600;
@@ -192,10 +197,22 @@ fn try_pcp_map(gw: SocketAddr, internal_port: u16, lifetime: u32) -> Option<Port
 
     // PCP responses can carry option attributes after the fixed 60 bytes;
     // the server may also send other unsolicited messages on epoch reset.
-    // Loop until we see a matching MAP response or hit the timeout.
+    // Loop until we see a matching MAP response or hit the timeout, retransmitting
+    // the request a couple times to recover a dropped reply.
     let mut buf = [0u8; 1100];
+    let mut attempts_left = PORTMAP_SEND_ATTEMPTS - 1;
     loop {
-        let (n, src) = sock.recv_from(&mut buf).ok()?;
+        let (n, src) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => {
+                if attempts_left == 0 {
+                    return None;
+                }
+                attempts_left -= 1;
+                sock.send_to(&req, gw).ok()?;
+                continue;
+            }
+        };
         if src != gw || n < 60 {
             return None;
         }
@@ -293,8 +310,21 @@ fn try_natpmp_map(gw: SocketAddr, internal_port: u16, lifetime: u32) -> Option<P
     req[8..12].copy_from_slice(&lifetime.to_be_bytes());
     sock.send_to(&req, gw).ok()?;
 
+    // Retransmit on timeout to recover a dropped reply (see PORTMAP_SEND_ATTEMPTS).
     let mut buf = [0u8; 16];
-    let (n, src) = sock.recv_from(&mut buf).ok()?;
+    let mut attempts_left = PORTMAP_SEND_ATTEMPTS - 1;
+    let (n, src) = loop {
+        match sock.recv_from(&mut buf) {
+            Ok(v) => break v,
+            Err(_) => {
+                if attempts_left == 0 {
+                    return None;
+                }
+                attempts_left -= 1;
+                sock.send_to(&req, gw).ok()?;
+            }
+        }
+    };
     if src != gw || n < 16 {
         return None;
     }
