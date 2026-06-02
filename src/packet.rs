@@ -285,6 +285,11 @@ pub enum PayloadType {
     Audio = 2,
     /// Single-parity FEC packet for a video unit.
     Parity = 8,
+    /// Server→client liveness keepalive (header only, no payload). Sent on the
+    /// media path when no video is flowing (e.g. a static screen, where the
+    /// capture backend produces no new frames) so the client can distinguish a
+    /// genuinely dead UDP path from an idle one and not false-trigger reconnect.
+    Keepalive = 9,
     /// Absolute mouse position input from client to server.
     MouseAbsolute = 3,
     /// Relative mouse delta input from client to server.
@@ -304,6 +309,7 @@ impl PayloadType {
             1 => Some(Self::Data),
             2 => Some(Self::Audio),
             8 => Some(Self::Parity),
+            9 => Some(Self::Keepalive),
             3 => Some(Self::MouseAbsolute),
             4 => Some(Self::MouseRelative),
             5 => Some(Self::MouseButtons),

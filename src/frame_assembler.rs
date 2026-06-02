@@ -198,6 +198,10 @@ impl FrameAssembler {
                 // Audio packets are demuxed at the transport layer, not assembled.
                 return outcome;
             }
+            PayloadType::Keepalive => {
+                // Liveness keepalive — never part of media reassembly.
+                return outcome;
+            }
             PayloadType::MouseAbsolute
             | PayloadType::MouseRelative
             | PayloadType::MouseButtons
