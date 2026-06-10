@@ -9,6 +9,8 @@ pub mod portmap;
 #[cfg(feature = "tunnel")]
 pub mod reliable_udp;
 #[cfg(feature = "tunnel")]
+pub mod tcp_tunnel;
+#[cfg(feature = "tunnel")]
 pub mod tunnel;
 
 pub use control::{

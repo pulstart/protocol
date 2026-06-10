@@ -28,6 +28,10 @@ pub struct FrameSlicer {
     packets: Vec<Vec<u8>>,
     max_payload: usize,
     fec: FecConfig,
+    /// When false, no parity packets are built at all (reliable links such as
+    /// the TCP tunnel have nothing to recover, so the per-frame XOR/RS pass is
+    /// pure waste). Default true.
+    parity_enabled: bool,
     // XOR scratch.
     parity_data: Vec<u8>,
     // Parity packets for the last sliced unit (XOR ⇒ 0/1, RS ⇒ 0..M).
@@ -59,6 +63,7 @@ impl FrameSlicer {
             packets: Vec::new(),
             max_payload: clamped_udp - HEADER_SIZE,
             fec,
+            parity_enabled: true,
             parity_data: Vec::new(),
             parity_packets: Vec::new(),
             rs_shards: Vec::new(),
@@ -67,6 +72,13 @@ impl FrameSlicer {
 
     pub fn set_fec(&mut self, fec: FecConfig) {
         self.fec = fec;
+    }
+
+    /// Enable/disable parity construction. Disable on reliable links (TCP
+    /// tunnel) so no per-frame XOR/RS work is done for packets that would only
+    /// be discarded.
+    pub fn set_parity_enabled(&mut self, enabled: bool) {
+        self.parity_enabled = enabled;
     }
 
     pub fn fec_mode(&self) -> FecMode {
@@ -173,7 +185,7 @@ impl FrameSlicer {
         self.packets.resize_with(count, Vec::new);
         self.packets.truncate(count);
 
-        let do_fec = total_packets > 1;
+        let do_fec = total_packets > 1 && self.parity_enabled;
         let rs = do_fec && self.fec.mode == FecMode::Rs;
         let shard_len = self.rs_shard_len();
         if rs {
@@ -452,6 +464,27 @@ mod tests {
         assert!(packets.len() > 1);
         assert!(packets.iter().all(|pkt| pkt.len() <= 1_200));
         assert!(slicer.parity_packet().unwrap().len() <= 1_200);
+    }
+
+    #[test]
+    fn parity_disabled_builds_no_parity_packets() {
+        // Reliable links (TCP tunnel) disable parity entirely: the data
+        // packets are still produced, but no XOR/RS parity is built or emitted.
+        let fec = FecConfig {
+            mode: FecMode::Rs,
+            fec_pct: 30,
+            min_parity: 2,
+        };
+        let mut slicer = FrameSlicer::with_config(1_400, fec);
+        slicer.set_parity_enabled(false);
+        let data = vec![0x42; 12_000];
+        let (packets, parity) = {
+            let (p, q) =
+                slicer.slice_with_meta_parts(&data, 1, FrameTimingMeta::default(), frame_type::IDR);
+            (p.to_vec(), q.to_vec())
+        };
+        assert!(packets.len() > 1, "multi-packet unit expected");
+        assert!(parity.is_empty(), "no parity should be built when disabled");
     }
 
     #[test]
