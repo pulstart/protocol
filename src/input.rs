@@ -8,6 +8,27 @@ pub const MOUSE_BUTTON_EXTRA2: u8 = 1 << 4;
 /// High-resolution wheel units per traditional mouse-wheel notch.
 pub const MOUSE_WHEEL_STEP_UNITS: i16 = 120;
 pub const KEYBOARD_STATE_BYTES: usize = 16;
+pub const INPUT_CREDENTIAL_BYTES: usize = 16;
+
+/// Per-session secret that authenticates UDP input datagrams.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct InputCredential([u8; INPUT_CREDENTIAL_BYTES]);
+
+impl InputCredential {
+    pub const fn from_bytes(bytes: [u8; INPUT_CREDENTIAL_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; INPUT_CREDENTIAL_BYTES] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for InputCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InputCredential([REDACTED])")
+    }
+}
 
 const MOUSE_ABSOLUTE_PAYLOAD_SIZE: usize = 9;
 const MOUSE_RELATIVE_PAYLOAD_SIZE: usize = 9;
@@ -19,91 +40,135 @@ const KEYBOARD_STATE_PAYLOAD_SIZE: usize = 4 + KEYBOARD_STATE_BYTES;
 #[repr(u8)]
 pub enum KeyboardKey {
     Escape = 0,
-    Tab,
-    Backspace,
-    Enter,
-    Space,
-    Insert,
-    Delete,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    ArrowUp,
-    ArrowDown,
-    ArrowLeft,
-    ArrowRight,
-    Minus,
-    Equals,
-    OpenBracket,
-    CloseBracket,
-    Backslash,
-    Semicolon,
-    Quote,
-    Backtick,
-    Comma,
-    Period,
-    Slash,
-    Num0,
-    Num1,
-    Num2,
-    Num3,
-    Num4,
-    Num5,
-    Num6,
-    Num7,
-    Num8,
-    Num9,
-    A,
-    B,
-    C,
-    D,
-    E,
-    F,
-    G,
-    H,
-    I,
-    J,
-    K,
-    L,
-    M,
-    N,
-    O,
-    P,
-    Q,
-    R,
-    S,
-    T,
-    U,
-    V,
-    W,
-    X,
-    Y,
-    Z,
-    F1,
-    F2,
-    F3,
-    F4,
-    F5,
-    F6,
-    F7,
-    F8,
-    F9,
-    F10,
-    F11,
-    F12,
-    LeftShift,
-    LeftCtrl,
-    LeftAlt,
-    LeftMeta,
-    RightShift,
-    RightCtrl,
-    RightAlt,
-    RightMeta,
+    Tab = 1,
+    Backspace = 2,
+    Enter = 3,
+    Space = 4,
+    Insert = 5,
+    Delete = 6,
+    Home = 7,
+    End = 8,
+    PageUp = 9,
+    PageDown = 10,
+    ArrowUp = 11,
+    ArrowDown = 12,
+    ArrowLeft = 13,
+    ArrowRight = 14,
+    Minus = 15,
+    Equals = 16,
+    OpenBracket = 17,
+    CloseBracket = 18,
+    Backslash = 19,
+    Semicolon = 20,
+    Quote = 21,
+    Backtick = 22,
+    Comma = 23,
+    Period = 24,
+    Slash = 25,
+    Num0 = 26,
+    Num1 = 27,
+    Num2 = 28,
+    Num3 = 29,
+    Num4 = 30,
+    Num5 = 31,
+    Num6 = 32,
+    Num7 = 33,
+    Num8 = 34,
+    Num9 = 35,
+    A = 36,
+    B = 37,
+    C = 38,
+    D = 39,
+    E = 40,
+    F = 41,
+    G = 42,
+    H = 43,
+    I = 44,
+    J = 45,
+    K = 46,
+    L = 47,
+    M = 48,
+    N = 49,
+    O = 50,
+    P = 51,
+    Q = 52,
+    R = 53,
+    S = 54,
+    T = 55,
+    U = 56,
+    V = 57,
+    W = 58,
+    X = 59,
+    Y = 60,
+    Z = 61,
+    F1 = 62,
+    F2 = 63,
+    F3 = 64,
+    F4 = 65,
+    F5 = 66,
+    F6 = 67,
+    F7 = 68,
+    F8 = 69,
+    F9 = 70,
+    F10 = 71,
+    F11 = 72,
+    F12 = 73,
+    LeftShift = 74,
+    LeftCtrl = 75,
+    LeftAlt = 76,
+    LeftMeta = 77,
+    RightShift = 78,
+    RightCtrl = 79,
+    RightAlt = 80,
+    RightMeta = 81,
+    CapsLock = 82,
+    NumLock = 83,
+    ScrollLock = 84,
+    PrintScreen = 85,
+    Pause = 86,
+    Application = 87,
+    Numpad0 = 88,
+    Numpad1 = 89,
+    Numpad2 = 90,
+    Numpad3 = 91,
+    Numpad4 = 92,
+    Numpad5 = 93,
+    Numpad6 = 94,
+    Numpad7 = 95,
+    Numpad8 = 96,
+    Numpad9 = 97,
+    NumpadDecimal = 98,
+    NumpadDivide = 99,
+    NumpadMultiply = 100,
+    NumpadSubtract = 101,
+    NumpadAdd = 102,
+    NumpadEnter = 103,
+    NumpadEquals = 104,
+    NumpadComma = 105,
+    F13 = 106,
+    F14 = 107,
+    F15 = 108,
+    F16 = 109,
+    F17 = 110,
+    F18 = 111,
+    F19 = 112,
+    F20 = 113,
+    F21 = 114,
+    F22 = 115,
+    F23 = 116,
+    F24 = 117,
+    VolumeMute = 118,
+    VolumeDown = 119,
+    VolumeUp = 120,
+    MediaPrevious = 121,
+    MediaNext = 122,
+    MediaPlayPause = 123,
+    MediaStop = 124,
+    IntlBackslash = 125,
 }
 
 impl KeyboardKey {
-    pub const COUNT: usize = Self::RightMeta as usize + 1;
+    pub const COUNT: usize = Self::IntlBackslash as usize + 1;
 
     pub fn bit(self) -> (usize, u8) {
         let index = self as usize;
@@ -111,9 +176,9 @@ impl KeyboardKey {
     }
 
     pub fn from_u8(value: u8) -> Option<Self> {
-        if value <= Self::RightMeta as u8 {
+        if value <= Self::IntlBackslash as u8 {
             // SAFETY: KeyboardKey is a repr(u8) enum with contiguous discriminants from 0
-            // through RightMeta.
+            // through IntlBackslash.
             Some(unsafe { std::mem::transmute::<u8, Self>(value) })
         } else {
             None
@@ -282,7 +347,7 @@ pub enum InputPacket {
 }
 
 impl InputPacket {
-    pub fn serialize(&self, seq: u16) -> Vec<u8> {
+    pub fn serialize(&self, seq: u16, credential: InputCredential) -> Vec<u8> {
         let payload_len = match self {
             Self::MouseAbsolute(_) => MOUSE_ABSOLUTE_PAYLOAD_SIZE,
             Self::MouseRelative(_) => MOUSE_RELATIVE_PAYLOAD_SIZE,
@@ -291,7 +356,7 @@ impl InputPacket {
             Self::KeyboardState(_) => KEYBOARD_STATE_PAYLOAD_SIZE,
         };
 
-        let mut buf = Vec::with_capacity(HEADER_SIZE + payload_len);
+        let mut buf = Vec::with_capacity(HEADER_SIZE + INPUT_CREDENTIAL_BYTES + payload_len);
         buf.resize(HEADER_SIZE, 0);
         let header = PacketHeader {
             seq,
@@ -299,6 +364,7 @@ impl InputPacket {
             payload_type: self.payload_type(),
         };
         header.serialize(&mut buf[..HEADER_SIZE]);
+        buf.extend_from_slice(credential.as_bytes());
         match self {
             Self::MouseAbsolute(packet) => packet.serialize_payload(&mut buf),
             Self::MouseRelative(packet) => packet.serialize_payload(&mut buf),
@@ -309,9 +375,14 @@ impl InputPacket {
         buf
     }
 
-    pub fn deserialize(raw: &[u8]) -> Option<(PacketHeader, Self)> {
+    pub fn deserialize(raw: &[u8]) -> Option<(PacketHeader, InputCredential, Self)> {
         let header = PacketHeader::deserialize(raw)?;
-        let payload = &raw[HEADER_SIZE..];
+        let credential_bytes: [u8; INPUT_CREDENTIAL_BYTES] = raw
+            .get(HEADER_SIZE..HEADER_SIZE + INPUT_CREDENTIAL_BYTES)?
+            .try_into()
+            .ok()?;
+        let credential = InputCredential::from_bytes(credential_bytes);
+        let payload = &raw[HEADER_SIZE + INPUT_CREDENTIAL_BYTES..];
         let packet = match header.payload_type {
             PayloadType::MouseAbsolute => {
                 Self::MouseAbsolute(MouseAbsoluteInput::deserialize_payload(payload)?)
@@ -330,7 +401,7 @@ impl InputPacket {
             }
             _ => return None,
         };
-        Some((header, packet))
+        Some((header, credential, packet))
     }
 
     fn payload_type(&self) -> PayloadType {
@@ -348,6 +419,8 @@ impl InputPacket {
 mod tests {
     use super::*;
 
+    const CREDENTIAL: InputCredential = InputCredential::from_bytes([0xA5; 16]);
+
     #[test]
     fn roundtrip_mouse_absolute() {
         let packet = InputPacket::MouseAbsolute(MouseAbsoluteInput {
@@ -356,9 +429,10 @@ mod tests {
             y: 4321,
             buttons: MOUSE_BUTTON_PRIMARY | MOUSE_BUTTON_SECONDARY,
         });
-        let raw = packet.serialize(99);
-        let (header, decoded) = InputPacket::deserialize(&raw).unwrap();
+        let raw = packet.serialize(99, CREDENTIAL);
+        let (header, credential, decoded) = InputPacket::deserialize(&raw).unwrap();
         assert_eq!(header.seq, 99);
+        assert_eq!(credential, CREDENTIAL);
         assert_eq!(decoded, packet);
     }
 
@@ -370,8 +444,9 @@ mod tests {
             dy: 42,
             buttons: MOUSE_BUTTON_MIDDLE,
         });
-        let raw = packet.serialize(11);
-        let (_, decoded) = InputPacket::deserialize(&raw).unwrap();
+        let raw = packet.serialize(11, CREDENTIAL);
+        let (_, credential, decoded) = InputPacket::deserialize(&raw).unwrap();
+        assert_eq!(credential, CREDENTIAL);
         assert_eq!(decoded, packet);
     }
 
@@ -381,8 +456,9 @@ mod tests {
             client_id: 9,
             buttons: MOUSE_BUTTON_EXTRA1 | MOUSE_BUTTON_EXTRA2,
         });
-        let raw = packet.serialize(27);
-        let (_, decoded) = InputPacket::deserialize(&raw).unwrap();
+        let raw = packet.serialize(27, CREDENTIAL);
+        let (_, credential, decoded) = InputPacket::deserialize(&raw).unwrap();
+        assert_eq!(credential, CREDENTIAL);
         assert_eq!(decoded, packet);
     }
 
@@ -394,8 +470,9 @@ mod tests {
             delta_y: 3,
             buttons: MOUSE_BUTTON_PRIMARY,
         });
-        let raw = packet.serialize(51);
-        let (_, decoded) = InputPacket::deserialize(&raw).unwrap();
+        let raw = packet.serialize(51, CREDENTIAL);
+        let (_, credential, decoded) = InputPacket::deserialize(&raw).unwrap();
+        assert_eq!(credential, CREDENTIAL);
         assert_eq!(decoded, packet);
     }
 
@@ -410,9 +487,112 @@ mod tests {
             client_id: 21,
             pressed,
         });
-        let raw = packet.serialize(88);
-        let (header, decoded) = InputPacket::deserialize(&raw).unwrap();
+        let raw = packet.serialize(88, CREDENTIAL);
+        let (header, credential, decoded) = InputPacket::deserialize(&raw).unwrap();
         assert_eq!(header.seq, 88);
+        assert_eq!(credential, CREDENTIAL);
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn keyboard_wire_ids_are_stable() {
+        assert_eq!(KeyboardKey::Escape as u8, 0);
+        assert_eq!(KeyboardKey::Enter as u8, 3);
+        assert_eq!(KeyboardKey::A as u8, 36);
+        assert_eq!(KeyboardKey::F12 as u8, 73);
+        assert_eq!(KeyboardKey::RightMeta as u8, 81);
+
+        let appended = [
+            KeyboardKey::CapsLock,
+            KeyboardKey::NumLock,
+            KeyboardKey::ScrollLock,
+            KeyboardKey::PrintScreen,
+            KeyboardKey::Pause,
+            KeyboardKey::Application,
+            KeyboardKey::Numpad0,
+            KeyboardKey::Numpad1,
+            KeyboardKey::Numpad2,
+            KeyboardKey::Numpad3,
+            KeyboardKey::Numpad4,
+            KeyboardKey::Numpad5,
+            KeyboardKey::Numpad6,
+            KeyboardKey::Numpad7,
+            KeyboardKey::Numpad8,
+            KeyboardKey::Numpad9,
+            KeyboardKey::NumpadDecimal,
+            KeyboardKey::NumpadDivide,
+            KeyboardKey::NumpadMultiply,
+            KeyboardKey::NumpadSubtract,
+            KeyboardKey::NumpadAdd,
+            KeyboardKey::NumpadEnter,
+            KeyboardKey::NumpadEquals,
+            KeyboardKey::NumpadComma,
+            KeyboardKey::F13,
+            KeyboardKey::F14,
+            KeyboardKey::F15,
+            KeyboardKey::F16,
+            KeyboardKey::F17,
+            KeyboardKey::F18,
+            KeyboardKey::F19,
+            KeyboardKey::F20,
+            KeyboardKey::F21,
+            KeyboardKey::F22,
+            KeyboardKey::F23,
+            KeyboardKey::F24,
+            KeyboardKey::VolumeMute,
+            KeyboardKey::VolumeDown,
+            KeyboardKey::VolumeUp,
+            KeyboardKey::MediaPrevious,
+            KeyboardKey::MediaNext,
+            KeyboardKey::MediaPlayPause,
+            KeyboardKey::MediaStop,
+            KeyboardKey::IntlBackslash,
+        ];
+        for (offset, key) in appended.into_iter().enumerate() {
+            assert_eq!(key as usize, 82 + offset);
+            assert_eq!(KeyboardKey::from_u8(key as u8), Some(key));
+        }
+        assert_eq!(KeyboardKey::COUNT, 126);
+        assert_eq!(KeyboardKey::from_u8(126), None);
+    }
+
+    #[test]
+    fn expanded_keyboard_state_has_stable_golden_bytes() {
+        let mut pressed = [0u8; KEYBOARD_STATE_BYTES];
+        for key in [
+            KeyboardKey::CapsLock,
+            KeyboardKey::Numpad0,
+            KeyboardKey::F24,
+            KeyboardKey::IntlBackslash,
+        ] {
+            let (byte, bit) = key.bit();
+            pressed[byte] |= bit;
+        }
+        let raw = InputPacket::KeyboardState(KeyboardStateInput {
+            client_id: 0x0102_0304,
+            pressed,
+        })
+        .serialize(0x1234, CREDENTIAL);
+        assert_eq!(
+            raw,
+            vec![
+                0x12, 0x34, 0, 0, 0, 0, 7, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5,
+                0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0x04, 0x01, 0, 0, 0x20, 0x20,
+            ]
+        );
+    }
+
+    #[test]
+    fn input_rejects_missing_or_truncated_credential() {
+        let packet = InputPacket::MouseButtons(MouseButtonsInput {
+            client_id: 1,
+            buttons: 0,
+        });
+        let raw = packet.serialize(1, CREDENTIAL);
+        assert!(InputPacket::deserialize(&raw[..HEADER_SIZE]).is_none());
+        assert!(
+            InputPacket::deserialize(&raw[..HEADER_SIZE + INPUT_CREDENTIAL_BYTES - 1]).is_none()
+        );
     }
 }

@@ -374,8 +374,6 @@ pub fn try_acquire(internal_port: u16) -> Option<PortMapping> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// PCP request layout sanity: a well-formed MAP request must be exactly
     /// 60 bytes (24-byte common header + 36-byte MAP body). Catches drift if
     /// someone resizes the byte arrays.

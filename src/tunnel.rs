@@ -2,14 +2,18 @@ use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit},
     ChaCha20Poly1305,
 };
+use hkdf::Hkdf;
 use rand::rngs::OsRng;
+use sha2::Sha256;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Per-packet encryption overhead: 12-byte nonce + 16-byte AEAD tag.
 pub const CRYPTO_OVERHEAD: usize = 28;
+const REPLAY_WINDOW_BITS: u64 = 128;
 
 // ---------------------------------------------------------------------------
 // Key exchange
@@ -33,12 +37,89 @@ impl TunnelKeys {
         self.public.to_bytes()
     }
 
-    /// Compute the shared secret from the partner's public key.
-    /// The resulting 32 bytes are used directly as the ChaCha20-Poly1305 key.
+    /// Compute the shared secret from the partner's public key. Callers must
+    /// pass it through [`derive_session_key`] before constructing an AEAD.
     pub fn derive_shared_key(&self, peer_public_bytes: &[u8; 32]) -> [u8; 32] {
         let peer = PublicKey::from(*peer_public_bytes);
         self.secret.diffie_hellman(&peer).to_bytes()
     }
+
+    /// Derive an AEAD key scoped to one API-authorized punch or relay request.
+    pub fn derive_session_key(
+        &self,
+        peer_public_bytes: &[u8; 32],
+        context: &SessionKeyContext<'_>,
+    ) -> Result<[u8; 32], String> {
+        derive_session_key(&self.derive_shared_key(peer_public_bytes), context)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelMode {
+    Punch,
+    Relay,
+}
+
+impl TunnelMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Punch => "punch",
+            Self::Relay => "relay",
+        }
+    }
+}
+
+/// Signaling values authenticated into a request-scoped tunnel key.
+#[derive(Clone, Copy)]
+pub struct SessionKeyContext<'a> {
+    pub request_context: &'a str,
+    pub session_id: &'a str,
+    pub mode: TunnelMode,
+    pub generation: u64,
+    pub host_peer_id: &'a str,
+    pub host_lease_id: &'a str,
+    pub client_peer_id: &'a str,
+    pub client_lease_id: &'a str,
+}
+
+/// Expand an X25519 shared secret into a unique key for one signaling request.
+pub fn derive_session_key(
+    shared_secret: &[u8; 32],
+    context: &SessionKeyContext<'_>,
+) -> Result<[u8; 32], String> {
+    if context.request_context.is_empty()
+        || context.session_id.is_empty()
+        || context.generation == 0
+        || context.host_peer_id.is_empty()
+        || context.host_lease_id.is_empty()
+        || context.client_peer_id.is_empty()
+        || context.client_lease_id.is_empty()
+    {
+        return Err("incomplete tunnel session key context".into());
+    }
+
+    fn append_field(info: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+        let len = u32::try_from(value.len()).map_err(|_| "tunnel key field too long")?;
+        info.extend_from_slice(&len.to_be_bytes());
+        info.extend_from_slice(value);
+        Ok(())
+    }
+
+    let mut info = Vec::with_capacity(256);
+    info.extend_from_slice(b"st-tunnel-session-key-v1");
+    append_field(&mut info, context.session_id.as_bytes())?;
+    append_field(&mut info, context.mode.label().as_bytes())?;
+    info.extend_from_slice(&context.generation.to_be_bytes());
+    append_field(&mut info, context.host_peer_id.as_bytes())?;
+    append_field(&mut info, context.host_lease_id.as_bytes())?;
+    append_field(&mut info, context.client_peer_id.as_bytes())?;
+    append_field(&mut info, context.client_lease_id.as_bytes())?;
+
+    let hkdf = Hkdf::<Sha256>::new(Some(context.request_context.as_bytes()), shared_secret);
+    let mut key = [0u8; 32];
+    hkdf.expand(&info, &mut key)
+        .map_err(|_| "failed to expand tunnel session key")?;
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -53,8 +134,52 @@ impl TunnelKeys {
 pub struct CryptoContext {
     cipher: ChaCha20Poly1305,
     send_counter: AtomicU64,
+    replay_window: Mutex<ReplayWindow>,
+    ordered_highest: Mutex<Option<u64>>,
     /// 0 = host (server), 1 = client
     direction: u8,
+}
+
+#[derive(Default)]
+struct ReplayWindow {
+    highest: Option<u64>,
+    seen: u128,
+}
+
+impl ReplayWindow {
+    fn can_accept(&self, counter: u64) -> bool {
+        let Some(highest) = self.highest else {
+            return true;
+        };
+        if counter > highest {
+            return true;
+        }
+        let age = highest - counter;
+        age < REPLAY_WINDOW_BITS && self.seen & (1u128 << age) == 0
+    }
+
+    fn accept(&mut self, counter: u64) -> bool {
+        if !self.can_accept(counter) {
+            return false;
+        }
+        match self.highest {
+            None => {
+                self.highest = Some(counter);
+                self.seen = 1;
+            }
+            Some(highest) if counter > highest => {
+                let shift = counter - highest;
+                self.seen = if shift >= REPLAY_WINDOW_BITS {
+                    1
+                } else {
+                    (self.seen << shift) | 1
+                };
+                self.highest = Some(counter);
+            }
+            Some(highest) => self.seen |= 1u128 << (highest - counter),
+        }
+        true
+    }
 }
 
 impl CryptoContext {
@@ -64,8 +189,18 @@ impl CryptoContext {
         Self {
             cipher,
             send_counter: AtomicU64::new(0),
+            replay_window: Mutex::new(ReplayWindow::default()),
+            ordered_highest: Mutex::new(None),
             direction: if is_host { 0 } else { 1 },
         }
+    }
+
+    fn next_send_counter(&self) -> u64 {
+        self.send_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |counter| {
+                counter.checked_add(1)
+            })
+            .expect("tunnel AEAD nonce counter exhausted")
     }
 
     fn make_nonce(direction: u8, counter: u64) -> chacha20poly1305::Nonce {
@@ -75,9 +210,40 @@ impl CryptoContext {
         *chacha20poly1305::Nonce::from_slice(&nonce)
     }
 
+    fn inbound_counter(&self, nonce: &[u8]) -> Option<u64> {
+        if nonce.len() != 12 || nonce[0] != (self.direction ^ 1) || nonce[1..4] != [0, 0, 0] {
+            return None;
+        }
+        Some(u64::from_be_bytes(nonce[4..12].try_into().ok()?))
+    }
+
+    fn replay_can_accept(&self, counter: u64) -> bool {
+        self.replay_window.lock().unwrap().can_accept(counter)
+    }
+
+    fn ordered_can_accept(&self, counter: u64) -> bool {
+        self.ordered_highest
+            .lock()
+            .unwrap()
+            .is_none_or(|highest| counter > highest)
+    }
+
+    fn record_inbound(&self, counter: u64, ordered: bool) -> bool {
+        if ordered {
+            let mut highest = self.ordered_highest.lock().unwrap();
+            if highest.is_some_and(|value| counter <= value) {
+                return false;
+            }
+            *highest = Some(counter);
+            true
+        } else {
+            self.replay_window.lock().unwrap().accept(counter)
+        }
+    }
+
     /// Encrypt `plaintext` → `[nonce:12][ciphertext+tag]`.
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self.next_send_counter();
         let nonce = Self::make_nonce(self.direction, counter);
         let ct = self
             .cipher
@@ -99,7 +265,7 @@ impl CryptoContext {
             "encrypt_into: buffer too small ({} < {required})",
             out.len()
         );
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self.next_send_counter();
         let nonce = Self::make_nonce(self.direction, counter);
         out[..12].copy_from_slice(nonce.as_slice());
         let payload_end = 12 + plaintext.len();
@@ -121,7 +287,7 @@ impl CryptoContext {
             "encrypt_staged_in_place: buffer too small ({} < {required})",
             buf.len()
         );
-        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = self.next_send_counter();
         let nonce = Self::make_nonce(self.direction, counter);
         buf[..12].copy_from_slice(nonce.as_slice());
         let payload_end = 12 + plaintext_len;
@@ -136,7 +302,26 @@ impl CryptoContext {
     /// Decrypt `[nonce:12][ciphertext+tag]` → plaintext.
     /// Returns `None` on authentication failure or truncated input.
     pub fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
+        self.decrypt_inner(data, false)
+    }
+
+    /// Decrypt a frame from a reliable ordered transport. Counters must be
+    /// strictly increasing; a duplicate or reordered frame closes the stream.
+    pub fn decrypt_ordered(&self, data: &[u8]) -> Option<Vec<u8>> {
+        self.decrypt_inner(data, true)
+    }
+
+    fn decrypt_inner(&self, data: &[u8], ordered: bool) -> Option<Vec<u8>> {
         if data.len() < CRYPTO_OVERHEAD {
+            return None;
+        }
+        let counter = self.inbound_counter(&data[..12])?;
+        let fresh = if ordered {
+            self.ordered_can_accept(counter)
+        } else {
+            self.replay_can_accept(counter)
+        };
+        if !fresh {
             return None;
         }
         let nonce = chacha20poly1305::Nonce::from_slice(&data[..12]);
@@ -146,13 +331,17 @@ impl CryptoContext {
         self.cipher
             .decrypt_in_place_detached(nonce, b"", &mut plaintext, tag)
             .ok()?;
-        Some(plaintext)
+        self.record_inbound(counter, ordered).then_some(plaintext)
     }
 
     /// Decrypt a packet in-place and return the plaintext slice backed by the
     /// caller-provided buffer.
     pub fn decrypt_in_place<'a>(&self, data: &'a mut [u8]) -> Option<&'a [u8]> {
         if data.len() < CRYPTO_OVERHEAD {
+            return None;
+        }
+        let counter = self.inbound_counter(&data[..12])?;
+        if !self.replay_can_accept(counter) {
             return None;
         }
         let (nonce_bytes, rest) = data.split_at_mut(12);
@@ -162,7 +351,7 @@ impl CryptoContext {
         self.cipher
             .decrypt_in_place_detached(nonce, b"", plaintext, &tag)
             .ok()?;
-        Some(plaintext)
+        self.record_inbound(counter, false).then_some(plaintext)
     }
 }
 
@@ -188,6 +377,17 @@ pub fn hole_punch(
     crypto: &CryptoContext,
     timeout: Duration,
 ) -> Result<SocketAddr, String> {
+    hole_punch_cancellable(socket, partner_candidates, crypto, timeout, || false)
+}
+
+/// Perform symmetric encrypted hole punching, aborting promptly when requested.
+pub fn hole_punch_cancellable(
+    socket: &UdpSocket,
+    partner_candidates: &[SocketAddr],
+    crypto: &CryptoContext,
+    timeout: Duration,
+    should_cancel: impl Fn() -> bool,
+) -> Result<SocketAddr, String> {
     if partner_candidates.is_empty() {
         return Err("no partner candidates".into());
     }
@@ -207,6 +407,9 @@ pub fn hole_punch(
     let mut last_send = Instant::now() - Duration::from_secs(1);
 
     while Instant::now() < deadline {
+        if should_cancel() {
+            return Err("hole punch cancelled".into());
+        }
         // Blast probes to every candidate every 500 ms.
         // Re-encrypt each round so each probe gets a fresh nonce — avoids
         // identical ciphertext that middleboxes might deduplicate.
@@ -224,7 +427,7 @@ pub fn hole_punch(
                 if let Some(pt) = crypto.decrypt(&buf[..n]) {
                     if pt == b"STPUNCH" || pt == b"STPUNCH_ACK" {
                         // Validate source is one of the expected partner candidates.
-                        let src_matches = partner_candidates.iter().any(|c| *c == src);
+                        let src_matches = partner_candidates.contains(&src);
                         if !src_matches {
                             // Accept anyway — NAT may rewrite ports — but the
                             // decryption success already authenticates the peer.
@@ -370,13 +573,17 @@ pub fn stun_discover_all(local_socket: &UdpSocket) -> Vec<SocketAddr> {
     let _ = local_socket.set_read_timeout(Some(Duration::from_millis(100)));
 
     let mut pending: Vec<Pending> = Vec::new();
+    let local_is_ipv4 = local_socket.local_addr().ok().map(|addr| addr.is_ipv4());
     for server in STUN_SERVERS {
-        let Some(dst) = server.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+        let Ok(destinations) = server.to_socket_addrs() else {
             continue;
         };
-        let tx: [u8; 12] = rand::random();
-        let _ = local_socket.send_to(&stun_request_bytes(&tx), dst);
-        pending.push(Pending { dst, tx, got: None });
+        for dst in destinations.filter(|dst| local_is_ipv4.is_none_or(|ipv4| dst.is_ipv4() == ipv4))
+        {
+            let tx: [u8; 12] = rand::random();
+            let _ = local_socket.send_to(&stun_request_bytes(&tx), dst);
+            pending.push(Pending { dst, tx, got: None });
+        }
     }
 
     if !pending.is_empty() {
@@ -514,7 +721,57 @@ pub fn gather_local_candidates(port: u16) -> Vec<String> {
 
 /// Enumerate non-loopback local IP addresses using platform-specific methods.
 fn enumerate_local_ips() -> Vec<std::net::IpAddr> {
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
     let mut ips = Vec::new();
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
+    let ips = Vec::new();
+
+    #[cfg(target_os = "android")]
+    {
+        let mut interfaces: *mut libc::ifaddrs = std::ptr::null_mut();
+        // Android does not ship the desktop interface-enumeration commands.
+        // getifaddrs is available at the minimum supported API level.
+        if unsafe { libc::getifaddrs(&mut interfaces) } == 0 {
+            let mut current = interfaces;
+            while !current.is_null() {
+                let address = unsafe { (*current).ifa_addr };
+                if !address.is_null() {
+                    let ip = match i32::from(unsafe { (*address).sa_family }) {
+                        libc::AF_INET => {
+                            let address = unsafe { &*(address.cast::<libc::sockaddr_in>()) };
+                            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                                u32::from_be(address.sin_addr.s_addr),
+                            )))
+                        }
+                        libc::AF_INET6 => {
+                            let address = unsafe { &*(address.cast::<libc::sockaddr_in6>()) };
+                            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                                address.sin6_addr.s6_addr,
+                            )))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ip) = ip {
+                        if !ip.is_loopback() && !ip.is_unspecified() && !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                }
+                current = unsafe { (*current).ifa_next };
+            }
+            unsafe { libc::freeifaddrs(interfaces) };
+        }
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -591,6 +848,10 @@ fn enumerate_local_ips() -> Vec<std::net::IpAddr> {
 /// route to. 16 is plenty for any realistic deployment.
 pub const MAX_GATHERED_CANDIDATES: usize = 16;
 
+fn candidate_string(ip: std::net::IpAddr, port: u16) -> String {
+    SocketAddr::new(ip, port).to_string()
+}
+
 /// Like `gather_local_candidates`, but also performs STUN discovery on the given socket.
 ///
 /// Candidate ordering:
@@ -605,13 +866,19 @@ pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -
     use std::net::UdpSocket as StdUdp;
 
     let mut candidates: Vec<String> = Vec::new();
+    let socket_is_ipv4 = stun_socket
+        .and_then(|socket| socket.local_addr().ok())
+        .map(|addr| addr.is_ipv4());
+    let supports_ip = |ip: std::net::IpAddr| socket_is_ipv4.is_none_or(|ipv4| ip.is_ipv4() == ipv4);
 
     // 1. Default-route local IP via unconnected UDP trick — the partner is
     //    most likely reachable at the same NIC that exits the host.
     if let Ok(sock) = StdUdp::bind("0.0.0.0:0") {
         if sock.connect("8.8.8.8:80").is_ok() {
             if let Ok(local) = sock.local_addr() {
-                candidates.push(format!("{}:{port}", local.ip()));
+                if supports_ip(local.ip()) {
+                    candidates.push(candidate_string(local.ip(), port));
+                }
             }
         }
     }
@@ -654,7 +921,10 @@ pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -
         if candidates.len() >= MAX_GATHERED_CANDIDATES {
             break;
         }
-        let c = format!("{ip}:{port}");
+        if !supports_ip(ip) {
+            continue;
+        }
+        let c = candidate_string(ip, port);
         if !candidates.contains(&c) {
             candidates.push(c);
         }
@@ -668,6 +938,196 @@ pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    fn key_context<'a>(
+        request_context: &'a str,
+        client_peer_id: &'a str,
+        client_lease_id: &'a str,
+        generation: u64,
+    ) -> SessionKeyContext<'a> {
+        SessionKeyContext {
+            request_context,
+            session_id: "api-session",
+            mode: TunnelMode::Punch,
+            generation,
+            host_peer_id: "host",
+            host_lease_id: "host-lease",
+            client_peer_id,
+            client_lease_id,
+        }
+    }
+
+    #[test]
+    fn request_context_derives_symmetric_distinct_aead_keys() {
+        let host = TunnelKeys::generate();
+        let client = TunnelKeys::generate();
+        let contexts = [
+            key_context("random-a1", "peer-a", "lease-a1", 1),
+            key_context("random-a2", "peer-a", "lease-a1", 2),
+            key_context("random-b", "peer-b", "lease-b", 1),
+            key_context("random-a3", "peer-a", "lease-a2", 1),
+        ];
+        let mut keys = Vec::new();
+        for context in &contexts {
+            let host_key = host
+                .derive_session_key(&client.public_key_bytes(), context)
+                .unwrap();
+            let client_key = client
+                .derive_session_key(&host.public_key_bytes(), context)
+                .unwrap();
+            assert_eq!(host_key, client_key);
+            keys.push(host_key);
+        }
+        for left in 0..keys.len() {
+            for right in left + 1..keys.len() {
+                assert_ne!(keys[left], keys[right]);
+                let left_packet = CryptoContext::new(keys[left], true).encrypt(b"same");
+                let right_packet = CryptoContext::new(keys[right], true).encrypt(b"same");
+                assert_ne!(
+                    (keys[left], &left_packet[..12]),
+                    (keys[right], &right_packet[..12])
+                );
+                assert_ne!(left_packet, right_packet);
+            }
+        }
+    }
+
+    #[test]
+    fn udp_replay_window_accepts_reordering_but_rejects_replays_and_old_packets() {
+        let sender = CryptoContext::new([0x31; 32], false);
+        let receiver = CryptoContext::new([0x31; 32], true);
+        let packets: Vec<_> = (0u64..130)
+            .map(|counter| sender.encrypt(&counter.to_be_bytes()))
+            .collect();
+
+        assert!(receiver.decrypt(&packets[2]).is_some());
+        assert!(receiver.decrypt(&packets[0]).is_some());
+        assert!(receiver.decrypt(&packets[1]).is_some());
+        assert!(receiver.decrypt(&packets[1]).is_none());
+        assert!(receiver.decrypt(&packets[129]).is_some());
+        assert!(receiver.decrypt(&packets[0]).is_none());
+    }
+
+    #[test]
+    fn ordered_decrypt_requires_monotonically_increasing_counters() {
+        let sender = CryptoContext::new([0x52; 32], false);
+        let receiver = CryptoContext::new([0x52; 32], true);
+        let first = sender.encrypt(b"first");
+        let second = sender.encrypt(b"second");
+
+        assert_eq!(
+            receiver.decrypt_ordered(&second).as_deref(),
+            Some(&b"second"[..])
+        );
+        assert!(receiver.decrypt_ordered(&first).is_none());
+        assert!(receiver.decrypt_ordered(&second).is_none());
+    }
+
+    #[test]
+    fn ciphertext_cannot_be_replayed_into_another_request_context() {
+        let shared = [0x73; 32];
+        let first_key =
+            derive_session_key(&shared, &key_context("request-one", "peer", "lease", 1)).unwrap();
+        let second_key =
+            derive_session_key(&shared, &key_context("request-two", "peer", "lease", 2)).unwrap();
+        let first = CryptoContext::new(first_key, false);
+        let second = CryptoContext::new(second_key, true);
+        let captured = first.encrypt(b"captured");
+
+        assert!(second.decrypt(&captured).is_none());
+    }
+
+    #[test]
+    fn candidate_strings_use_canonical_socket_address_format() {
+        assert_eq!(
+            candidate_string("2001:db8::1".parse().unwrap(), 5000),
+            "[2001:db8::1]:5000"
+        );
+        assert_eq!(
+            candidate_string("192.0.2.1".parse().unwrap(), 5000),
+            "192.0.2.1:5000"
+        );
+    }
+
+    #[test]
+    fn localhost_peers_complete_simultaneous_hole_punch() {
+        let host_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_socket.local_addr().unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let key = [0x39; 32];
+
+        let host = std::thread::spawn(move || {
+            hole_punch(
+                &host_socket,
+                &[client_addr],
+                &CryptoContext::new(key, true),
+                Duration::from_secs(2),
+            )
+        });
+        let client = std::thread::spawn(move || {
+            hole_punch(
+                &client_socket,
+                &[host_addr],
+                &CryptoContext::new(key, false),
+                Duration::from_secs(2),
+            )
+        });
+
+        assert_eq!(host.join().unwrap().unwrap(), client_addr);
+        assert_eq!(client.join().unwrap().unwrap(), host_addr);
+    }
+
+    #[test]
+    fn decrypt_rejects_packets_from_the_local_nonce_direction() {
+        let key = [0x42; 32];
+        let host = CryptoContext::new(key, true);
+        let client = CryptoContext::new(key, false);
+        let reflected = host.encrypt(b"STPUNCH");
+
+        assert!(host.decrypt(&reflected).is_none());
+        assert_eq!(client.decrypt(&reflected).as_deref(), Some(&b"STPUNCH"[..]));
+        assert!(client.decrypt(&reflected).is_none());
+
+        let mut reflected = reflected;
+        assert!(host.decrypt_in_place(&mut reflected).is_none());
+    }
+
+    #[test]
+    fn reflected_stpunch_echo_does_not_confirm_a_peer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_thread = std::thread::spawn(move || {
+            let mut packet = [0u8; 256];
+            let (len, source) = echo.recv_from(&mut packet).unwrap();
+            echo.send_to(&packet[..len], source).unwrap();
+        });
+
+        let result = hole_punch(
+            &socket,
+            &[echo_addr],
+            &CryptoContext::new([0x91; 32], true),
+            Duration::from_millis(250),
+        );
+        echo_thread.join().unwrap();
+        assert_eq!(result.unwrap_err(), "hole punch timed out");
+    }
+
+    #[test]
+    fn hole_punch_can_be_cancelled() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let candidate = "127.0.0.1:9".parse().unwrap();
+        let error = hole_punch_cancellable(
+            &socket,
+            &[candidate],
+            &CryptoContext::new([7; 32], false),
+            Duration::from_secs(10),
+            || true,
+        )
+        .unwrap_err();
+        assert_eq!(error, "hole punch cancelled");
+    }
 
     fn sa(ip: &str, port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(ip.parse::<Ipv4Addr>().unwrap()), port)

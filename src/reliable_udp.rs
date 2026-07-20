@@ -23,14 +23,32 @@ pub const PUNCHED_MEDIA_OVERHEAD: usize = 1;
 /// Per-packet overhead for punched-socket control: 1 byte channel + 12 bytes reliable header.
 pub const PUNCHED_CONTROL_OVERHEAD: usize = 1 + RELIABLE_HEADER_SIZE;
 
+const CONTROL_FRAGMENT_SINGLE: u8 = 0;
+const CONTROL_FRAGMENT_START: u8 = 1;
+const CONTROL_FRAGMENT_MIDDLE: u8 = 2;
+const CONTROL_FRAGMENT_END: u8 = 3;
+const CONTROL_FRAGMENT_HEADER_SIZE: usize = 5;
+const MAX_PUNCHED_DATAGRAM_SIZE: usize = 1200;
+const MAX_CONTROL_FRAGMENT_DATA: usize = MAX_PUNCHED_DATAGRAM_SIZE
+    - crate::tunnel::CRYPTO_OVERHEAD
+    - PUNCHED_CONTROL_OVERHEAD
+    - CONTROL_FRAGMENT_HEADER_SIZE;
+
 /// Maximum number of unacked reliable messages in flight.
-const MAX_SEND_WINDOW: usize = 64;
+/// One contiguous packet plus 32 selectively acknowledged packets fits the
+/// wire's 32-bit receive bitmap.
+const MAX_SEND_WINDOW: usize = 33;
 
 /// Hard cap on the local control backlog when the send window is full.
 /// Callers that exceed this are throttled out (`send_control` returns Err),
 /// matching the old behavior. File transfer / clipboard / etc. now ride the
 /// backlog through transient stalls instead of being silently dropped.
 const MAX_CONTROL_BACKLOG: usize = 1024;
+
+/// Largest complete serialized control bundle accepted for fragmentation.
+/// A bundle may contain multiple individually length-prefixed control frames.
+pub const MAX_PUNCHED_CONTROL_PAYLOAD: usize =
+    MAX_CONTROL_FRAGMENT_DATA * (MAX_SEND_WINDOW + MAX_CONTROL_BACKLOG);
 
 /// Initial retransmit timeout.
 const INITIAL_RTO: Duration = Duration::from_millis(200);
@@ -179,6 +197,7 @@ impl ReliableState {
         }
     }
 
+    #[cfg(test)]
     fn next_seq(&mut self) -> u32 {
         let seq = self.send_seq;
         self.send_seq = self.send_seq.wrapping_add(1);
@@ -190,6 +209,8 @@ impl ReliableState {
         // ack = the highest sequence number we have received (recv_next - 1),
         // or 0 if we haven't received anything yet.
         let ack = self.recv_next.wrapping_sub(1);
+        // Bit 0 represents ack+2 because ack+1 is recv_next, the missing packet
+        // that currently blocks contiguous delivery.
         (ack, self.recv_bitmap)
     }
 
@@ -199,9 +220,9 @@ impl ReliableState {
         self.send_queue.retain(|msg| {
             // Check if directly acked (seq == ack).
             let directly_acked = msg.seq == ack;
-            // Check if selectively acked via bitmap (bits represent ack+1, ack+2, ...).
+            // Check if selectively acked via bitmap (bits represent ack+2, ack+3, ...).
             let selectively_acked = {
-                let offset = msg.seq.wrapping_sub(ack).wrapping_sub(1);
+                let offset = msg.seq.wrapping_sub(ack).wrapping_sub(2);
                 offset < 32 && (ack_bits & (1 << offset)) != 0
             };
             // Check cumulative: seq < ack (with wrapping).
@@ -217,8 +238,7 @@ impl ReliableState {
                 let rtt = now.duration_since(msg.last_sent);
                 // Exponential moving average: rtt_est = 0.875 * rtt_est + 0.125 * rtt.
                 self.rtt_estimate = Duration::from_micros(
-                    (self.rtt_estimate.as_micros() as u64 * 7 / 8 + rtt.as_micros() as u64 / 8)
-                        as u64,
+                    self.rtt_estimate.as_micros() as u64 * 7 / 8 + rtt.as_micros() as u64 / 8,
                 );
                 self.rto = (self.rtt_estimate * 2).max(MIN_RTO).min(MAX_RTO);
             }
@@ -302,14 +322,16 @@ pub struct PunchedSocket {
     reliable: Mutex<ReliableState>,
     // Scratch buffers (per-thread callers clone the socket, so these are per-instance).
     encrypt_buf: Mutex<Vec<u8>>,
+    recv_buf: Mutex<Vec<u8>>,
+    /// All admitted control fragments, in strict wire order. This mutex also
+    /// serializes admission and draining into the reliable send window.
+    control_send: Mutex<VecDeque<Vec<u8>>>,
+    control_reassembly: Mutex<Option<(usize, Vec<u8>)>>,
     /// Messages decoded from a UDP datagram but not yet returned by `try_recv`.
     /// A single datagram can deliver multiple control messages when an in-order
     /// arrival drains buffered reordered packets; `try_recv` returns the first
     /// and leaves the rest here so they aren't silently lost.
     pending_in: Mutex<VecDeque<PunchedMessage>>,
-    /// Plaintext control payloads waiting for the reliable send window to free.
-    /// Drained by `tick()` as acks arrive.
-    pending_out: Mutex<VecDeque<Vec<u8>>>,
 }
 
 impl PunchedSocket {
@@ -321,9 +343,11 @@ impl PunchedSocket {
             peer,
             crypto,
             reliable: Mutex::new(ReliableState::new()),
-            encrypt_buf: Mutex::new(vec![0u8; 2048]),
+            encrypt_buf: Mutex::new(vec![0u8; MAX_PUNCHED_DATAGRAM_SIZE]),
+            recv_buf: Mutex::new(vec![0u8; MAX_PUNCHED_DATAGRAM_SIZE]),
+            control_send: Mutex::new(VecDeque::new()),
+            control_reassembly: Mutex::new(None),
             pending_in: Mutex::new(VecDeque::new()),
-            pending_out: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -340,6 +364,11 @@ impl PunchedSocket {
         let mut buf = self.encrypt_buf.lock().unwrap();
         let plain_len = 1 + data.len();
         let packet_len = plain_len + crate::tunnel::CRYPTO_OVERHEAD;
+        if packet_len > MAX_PUNCHED_DATAGRAM_SIZE {
+            return Err(format!(
+                "media packet exceeds punched UDP limit: {packet_len} > {MAX_PUNCHED_DATAGRAM_SIZE}"
+            ));
+        }
         buf.resize(packet_len, 0);
         buf[12] = CHANNEL_MEDIA;
         buf[13..13 + data.len()].copy_from_slice(data);
@@ -352,14 +381,14 @@ impl PunchedSocket {
         Ok(())
     }
 
-    /// Try to send `data` directly. Returns `true` if it entered the reliable
-    /// send window (and was emitted on the wire), `false` if the window was full.
-    fn try_send_control_now(&self, data: &[u8]) -> bool {
+    /// Try to emit the front control fragment. The sequence and retransmit entry
+    /// are committed only after the atomic UDP send succeeds.
+    fn try_send_control_now(&self, data: &[u8]) -> Result<bool, String> {
         let mut state = self.reliable.lock().unwrap();
         if state.send_queue.len() >= MAX_SEND_WINDOW {
-            return false;
+            return Ok(false);
         }
-        let seq = state.next_seq();
+        let seq = state.send_seq;
         let (ack, ack_bits) = state.ack_header();
         let total = 1 + RELIABLE_HEADER_SIZE + data.len();
         let mut plain = vec![0u8; total];
@@ -369,43 +398,62 @@ impl PunchedSocket {
         plain[9..13].copy_from_slice(&ack_bits.to_be_bytes());
         plain[13..].copy_from_slice(data);
         let encrypted = self.crypto.encrypt(&plain);
+        let sent = self
+            .socket
+            .send_to(&encrypted, self.peer)
+            .map_err(|error| format!("send_control: {error}"))?;
+        if sent != encrypted.len() {
+            return Err(format!(
+                "send_control: partial UDP datagram ({sent} < {})",
+                encrypted.len()
+            ));
+        }
+        state.send_seq = state.send_seq.wrapping_add(1);
         state.send_queue.push_back(UnackedMessage {
             seq,
-            payload: encrypted.clone(),
+            payload: encrypted,
             last_sent: Instant::now(),
             send_count: 1,
         });
-        drop(state);
-        let _ = self.socket.send_to(&encrypted, self.peer);
-        true
+        Ok(true)
     }
 
-    /// Send a reliable control message (channel 1). If the send window is full
-    /// the payload is queued in a bounded local backlog and drained by `tick()`
-    /// as acks arrive. Only returns Err when the backlog itself is full
-    /// (1024 deep), which keeps long file-transfer bursts from being silently
-    /// dropped without unbounded memory growth.
+    /// Send a reliable control message (channel 1). Admission is atomic across
+    /// every fragment: once accepted, the full message remains queued through
+    /// transient socket errors and is drained by `tick()` as room becomes
+    /// available. Returns `Err` only when the bounded queue cannot admit it.
     pub fn send_control(&self, data: &[u8]) -> Result<(), String> {
-        if self.try_send_control_now(data) {
-            return Ok(());
+        if data.len() > MAX_PUNCHED_CONTROL_PAYLOAD {
+            return Err(format!(
+                "reliable control payload exceeds UDP limit: {} > {MAX_PUNCHED_CONTROL_PAYLOAD}",
+                data.len()
+            ));
         }
-        let mut backlog = self.pending_out.lock().unwrap();
-        if backlog.len() >= MAX_CONTROL_BACKLOG {
+        let fragments = control_fragments(data);
+        let mut pending = self.control_send.lock().unwrap();
+        let queued = self.reliable.lock().unwrap().send_queue.len() + pending.len();
+        if queued + fragments.len() > MAX_SEND_WINDOW + MAX_CONTROL_BACKLOG {
             return Err("reliable send backlog full".into());
         }
-        backlog.push_back(data.to_vec());
+        pending.extend(fragments);
+        self.drain_pending_out_locked(&mut pending);
         Ok(())
     }
 
     /// Drain as much of the local control backlog into the send window as
     /// will fit. Called from `tick()`.
     fn drain_pending_out(&self) {
-        loop {
-            let next = self.pending_out.lock().unwrap().pop_front();
-            let Some(data) = next else { break };
-            if !self.try_send_control_now(&data) {
-                self.pending_out.lock().unwrap().push_front(data);
-                break;
+        let mut pending = self.control_send.lock().unwrap();
+        self.drain_pending_out_locked(&mut pending);
+    }
+
+    fn drain_pending_out_locked(&self, pending: &mut VecDeque<Vec<u8>>) {
+        while let Some(data) = pending.front() {
+            match self.try_send_control_now(data) {
+                Ok(true) => {
+                    pending.pop_front();
+                }
+                Ok(false) | Err(_) => break,
             }
         }
     }
@@ -464,8 +512,8 @@ impl PunchedSocket {
     /// Read one UDP datagram and decode it. Used by both `try_recv` and
     /// `try_recv_all`.
     fn recv_one_datagram(&self) -> Vec<PunchedMessage> {
-        let mut buf = [0u8; 2048];
-        let (n, _src) = match self.socket.recv_from(&mut buf) {
+        let mut buf = self.recv_buf.lock().unwrap();
+        let (n, src) = match self.socket.recv_from(&mut buf) {
             Ok(r) => r,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -475,6 +523,9 @@ impl PunchedSocket {
             }
             Err(_) => return Vec::new(),
         };
+        if src != self.peer {
+            return Vec::new();
+        }
 
         let plaintext = match self.crypto.decrypt_in_place(&mut buf[..n]) {
             Some(pt) => pt,
@@ -501,28 +552,35 @@ impl PunchedSocket {
                     u32::from_be_bytes([plaintext[9], plaintext[10], plaintext[11], plaintext[12]]);
                 let payload = plaintext[1 + RELIABLE_HEADER_SIZE..].to_vec();
 
-                let mut state = self.reliable.lock().unwrap();
-
-                // Process piggybacked ack (may free room in send window).
-                state.process_ack(ack, ack_bits);
-
-                // Record received seq and get deliverable payloads.
-                if payload.is_empty() {
-                    // Bare ack or empty control — nothing to deliver.
-                    return Vec::new();
-                }
-                let delivered = state.record_recv(seq, payload);
-                drop(state);
+                let delivered = {
+                    let mut state = self.reliable.lock().unwrap();
+                    // Process piggybacked ack (may free room in send window).
+                    state.process_ack(ack, ack_bits);
+                    if payload.is_empty() {
+                        Vec::new()
+                    } else {
+                        state.record_recv(seq, payload)
+                    }
+                };
 
                 // Acks may have freed window room — flush backlog opportunistically.
                 self.drain_pending_out();
+
+                if delivered.is_empty() && plaintext.len() == 1 + RELIABLE_HEADER_SIZE {
+                    // Bare ack — nothing to deliver and no ack response needed.
+                    return Vec::new();
+                }
 
                 // Send ack back.
                 let _ = self.send_ack();
 
                 // Return all deliverable messages (in-order + any consecutive
                 // buffered packets that became deliverable).
-                delivered.into_iter().map(PunchedMessage::Control).collect()
+                delivered
+                    .into_iter()
+                    .filter_map(|fragment| self.reassemble_control(fragment))
+                    .map(PunchedMessage::Control)
+                    .collect()
             }
             _ => Vec::new(),
         }
@@ -562,9 +620,9 @@ impl PunchedSocket {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             {
+                let pending = self.control_send.lock().unwrap();
                 let state = self.reliable.lock().unwrap();
-                let backlog_empty = self.pending_out.lock().unwrap().is_empty();
-                if state.send_queue.is_empty() && backlog_empty {
+                if state.send_queue.is_empty() && pending.is_empty() {
                     return Ok(());
                 }
             }
@@ -589,14 +647,408 @@ impl PunchedSocket {
             .set_read_timeout(dur)
             .map_err(|e| format!("set_read_timeout: {e}"))
     }
+
+    fn reassemble_control(&self, fragment: Vec<u8>) -> Option<Vec<u8>> {
+        let (&kind, body) = fragment.split_first()?;
+        let mut state = self.control_reassembly.lock().unwrap();
+        match kind {
+            CONTROL_FRAGMENT_SINGLE => {
+                *state = None;
+                Some(body.to_vec())
+            }
+            CONTROL_FRAGMENT_START if body.len() >= 4 => {
+                let expected = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
+                if expected > MAX_PUNCHED_CONTROL_PAYLOAD {
+                    *state = None;
+                    return None;
+                }
+                *state = Some((expected, body[4..].to_vec()));
+                None
+            }
+            CONTROL_FRAGMENT_MIDDLE => {
+                let (expected, data) = state.as_mut()?;
+                if data.len().saturating_add(body.len()) > *expected {
+                    *state = None;
+                    return None;
+                }
+                data.extend_from_slice(body);
+                None
+            }
+            CONTROL_FRAGMENT_END => {
+                let (expected, mut data) = state.take()?;
+                if data.len().saturating_add(body.len()) > expected {
+                    return None;
+                }
+                data.extend_from_slice(body);
+                (data.len() == expected).then_some(data)
+            }
+            _ => {
+                *state = None;
+                None
+            }
+        }
+    }
+}
+
+fn control_fragments(data: &[u8]) -> Vec<Vec<u8>> {
+    if data.len() <= MAX_CONTROL_FRAGMENT_DATA {
+        let mut fragment = Vec::with_capacity(1 + data.len());
+        fragment.push(CONTROL_FRAGMENT_SINGLE);
+        fragment.extend_from_slice(data);
+        return vec![fragment];
+    }
+
+    let chunks: Vec<_> = data.chunks(MAX_CONTROL_FRAGMENT_DATA).collect();
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut fragment = Vec::with_capacity(CONTROL_FRAGMENT_HEADER_SIZE + chunk.len());
+            if index == 0 {
+                fragment.push(CONTROL_FRAGMENT_START);
+                fragment.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            } else if index + 1 == chunks.len() {
+                fragment.push(CONTROL_FRAGMENT_END);
+            } else {
+                fragment.push(CONTROL_FRAGMENT_MIDDLE);
+            }
+            fragment.extend_from_slice(chunk);
+            fragment
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const TEST_KEY: [u8; 32] = [0x63; 32];
+
     fn p(seq: u32) -> Vec<u8> {
         seq.to_be_bytes().to_vec()
+    }
+
+    fn punched_pair() -> (PunchedSocket, PunchedSocket) {
+        let sender_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender_addr = sender_udp.local_addr().unwrap();
+        let receiver_addr = receiver_udp.local_addr().unwrap();
+        let sender = PunchedSocket::new(
+            sender_udp,
+            receiver_addr,
+            Arc::new(CryptoContext::new(TEST_KEY, false)),
+        );
+        let receiver = PunchedSocket::new(
+            receiver_udp,
+            sender_addr,
+            Arc::new(CryptoContext::new(TEST_KEY, true)),
+        );
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        (sender, receiver)
+    }
+
+    fn fill_send_window(socket: &PunchedSocket) {
+        let mut state = socket.reliable.lock().unwrap();
+        for _ in 0..MAX_SEND_WINDOW {
+            let seq = state.next_seq();
+            state.send_queue.push_back(UnackedMessage {
+                seq,
+                payload: vec![seq as u8],
+                last_sent: Instant::now(),
+                send_count: 1,
+            });
+        }
+    }
+
+    #[test]
+    fn punched_control_accepts_aggregate_bundle_and_rejects_oversize() {
+        let (sender, receiver) = punched_pair();
+
+        for payload in [
+            vec![0x5a; 4 * 1024],
+            vec![
+                0x6b;
+                crate::control::CONTROL_HEADER_SIZE + crate::control::MAX_CONTROL_PAYLOAD + 1024
+            ],
+        ] {
+            sender.send_control(&payload).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                sender.tick();
+                receiver.tick();
+                let _ = sender.try_recv_all();
+                if let Some(PunchedMessage::Control(received)) = receiver.try_recv() {
+                    assert_eq!(received, payload);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "control payload timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        assert!(sender
+            .send_control(&vec![0; MAX_PUNCHED_CONTROL_PAYLOAD + 1])
+            .is_err());
+    }
+
+    #[test]
+    fn backlogged_fragments_are_not_overtaken_by_a_new_message() {
+        let (sender, receiver) = punched_pair();
+        fill_send_window(&sender);
+        let first = vec![0xa1; MAX_CONTROL_FRAGMENT_DATA + 1];
+        let second = vec![0xb2; 8];
+        let first_fragments = control_fragments(&first);
+        let second_fragments = control_fragments(&second);
+
+        sender.send_control(&first).unwrap();
+        sender.reliable.lock().unwrap().send_queue.pop_front();
+        sender.send_control(&second).unwrap();
+
+        let state = sender.reliable.lock().unwrap();
+        let newest = state.send_queue.back().unwrap();
+        assert_eq!(newest.seq, MAX_SEND_WINDOW as u32);
+        let plaintext = receiver.crypto.decrypt(&newest.payload).unwrap();
+        assert_eq!(&plaintext[1 + RELIABLE_HEADER_SIZE..], first_fragments[0]);
+        drop(state);
+
+        let pending: Vec<_> = sender
+            .control_send
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            pending,
+            [first_fragments[1..].to_vec(), second_fragments].concat()
+        );
+    }
+
+    #[test]
+    fn concurrent_control_fragments_never_interleave() {
+        let (sender, _receiver) = punched_pair();
+        fill_send_window(&sender);
+        let sender = Arc::new(sender);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first = vec![0x11; MAX_CONTROL_FRAGMENT_DATA * 2 + 1];
+        let second = vec![0x22; MAX_CONTROL_FRAGMENT_DATA * 2 + 1];
+
+        let handles: Vec<_> = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|payload| {
+                let sender = Arc::clone(&sender);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sender.send_control(&payload).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let pending: Vec<_> = sender
+            .control_send
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        let first_fragments = control_fragments(&first);
+        let second_fragments = control_fragments(&second);
+        assert!(
+            pending == [first_fragments.clone(), second_fragments.clone()].concat()
+                || pending == [second_fragments, first_fragments].concat()
+        );
+    }
+
+    #[test]
+    fn bare_ack_drains_the_oldest_pending_fragment() {
+        let (sender, peer) = punched_pair();
+        fill_send_window(&sender);
+        sender.send_control(b"pending").unwrap();
+        assert_eq!(sender.control_send.lock().unwrap().len(), 1);
+
+        let mut ack = [0u8; 1 + RELIABLE_HEADER_SIZE];
+        ack[0] = CHANNEL_CONTROL;
+        ack[5..9].copy_from_slice(&0u32.to_be_bytes());
+        let encrypted = peer.crypto.encrypt(&ack);
+        peer.socket
+            .send_to(&encrypted, sender.socket.local_addr().unwrap())
+            .unwrap();
+
+        assert!(sender.try_recv().is_none());
+        assert!(sender.control_send.lock().unwrap().is_empty());
+        let state = sender.reliable.lock().unwrap();
+        assert_eq!(state.send_queue.len(), MAX_SEND_WINDOW);
+        assert_eq!(state.send_queue.back().unwrap().seq, MAX_SEND_WINDOW as u32);
+    }
+
+    #[test]
+    fn initial_send_error_keeps_every_fragment_queued() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let incompatible_peer: SocketAddr = "[::1]:9".parse().unwrap();
+        assert!(socket.send_to(&[0], incompatible_peer).is_err());
+        let sender = PunchedSocket::new(
+            socket,
+            incompatible_peer,
+            Arc::new(CryptoContext::new(TEST_KEY, false)),
+        );
+        let payload = vec![0x77; MAX_CONTROL_FRAGMENT_DATA * 2 + 1];
+        let fragments = control_fragments(&payload);
+
+        sender.send_control(&payload).unwrap();
+
+        let state = sender.reliable.lock().unwrap();
+        assert_eq!(state.send_seq, 0);
+        assert!(state.send_queue.is_empty());
+        drop(state);
+        let pending: Vec<_> = sender
+            .control_send
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(pending, fragments);
+    }
+
+    #[test]
+    fn receive_rejects_authenticated_datagram_from_non_peer() {
+        let (sender, receiver) = punched_pair();
+        let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let attacker_crypto = CryptoContext::new(TEST_KEY, false);
+        let forged = attacker_crypto.encrypt(&[CHANNEL_MEDIA, 0xde, 0xad]);
+        attacker
+            .send_to(&forged, receiver.socket.local_addr().unwrap())
+            .unwrap();
+        assert!(receiver.try_recv().is_none());
+
+        sender.send_media(b"valid").unwrap();
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Some(PunchedMessage::Media(data)) => assert_eq!(data, b"valid"),
+            _ => panic!("valid peer datagram was not received"),
+        }
+    }
+
+    #[test]
+    fn punched_media_is_bounded_by_receive_datagram_size() {
+        let (sender, receiver) = punched_pair();
+        let max_media =
+            MAX_PUNCHED_DATAGRAM_SIZE - crate::tunnel::CRYPTO_OVERHEAD - PUNCHED_MEDIA_OVERHEAD;
+        assert_eq!(
+            receiver.recv_buf.lock().unwrap().len(),
+            MAX_PUNCHED_DATAGRAM_SIZE
+        );
+        sender.send_media(&vec![0x44; max_media]).unwrap();
+        assert!(sender.send_media(&vec![0x44; max_media + 1]).is_err());
+    }
+
+    #[test]
+    fn selective_ack_does_not_ack_the_missing_contiguous_packet() {
+        let mut sender = ReliableState::new();
+        for _ in 0..2 {
+            let seq = sender.next_seq();
+            sender.send_queue.push_back(UnackedMessage {
+                seq,
+                payload: vec![seq as u8],
+                last_sent: Instant::now(),
+                send_count: 1,
+            });
+        }
+
+        let mut receiver = ReliableState::new();
+        assert!(receiver.record_recv(1, p(1)).is_empty());
+        let (ack, ack_bits) = receiver.ack_header();
+        sender.process_ack(ack, ack_bits);
+
+        assert_eq!(
+            sender
+                .send_queue
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn selective_ack_represents_the_full_reorder_bitmap() {
+        let mut sender = ReliableState::new();
+        for _ in 0..=32 {
+            let seq = sender.next_seq();
+            sender.send_queue.push_back(UnackedMessage {
+                seq,
+                payload: vec![seq as u8],
+                last_sent: Instant::now(),
+                send_count: 1,
+            });
+        }
+        let mut receiver = ReliableState::new();
+        assert!(receiver.record_recv(32, p(32)).is_empty());
+        let (ack, ack_bits) = receiver.ack_header();
+        sender.process_ack(ack, ack_bits);
+        assert!(sender.send_queue.iter().all(|message| message.seq != 32));
+        assert!(sender.send_queue.iter().any(|message| message.seq == 0));
+    }
+
+    #[test]
+    fn full_wire_window_survives_reordering_and_one_loss() {
+        let mut receiver = ReliableState::new();
+        let missing = 17u32;
+        for seq in (1..MAX_SEND_WINDOW as u32).rev() {
+            if seq != missing {
+                assert!(receiver.record_recv(seq, p(seq)).is_empty());
+            }
+        }
+        assert_eq!(receiver.recv_buf.len(), MAX_SEND_WINDOW - 2);
+
+        let first = receiver.record_recv(0, p(0));
+        assert_eq!(first, (0..missing).map(p).collect::<Vec<_>>());
+        assert_eq!(receiver.recv_next, missing);
+
+        let rest = receiver.record_recv(missing, p(missing));
+        assert_eq!(
+            rest,
+            (missing..MAX_SEND_WINDOW as u32).map(p).collect::<Vec<_>>()
+        );
+        assert_eq!(receiver.recv_next, MAX_SEND_WINDOW as u32);
+        assert_eq!(receiver.recv_bitmap, 0);
+        assert!(receiver.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn full_wire_window_reordering_and_ack_work_across_u32_wrap() {
+        let base = u32::MAX - 16;
+        let mut receiver = ReliableState::new();
+        receiver.recv_next = base;
+        for offset in (1..MAX_SEND_WINDOW as u32).rev() {
+            let seq = base.wrapping_add(offset);
+            assert!(receiver.record_recv(seq, p(seq)).is_empty());
+        }
+        let delivered = receiver.record_recv(base, p(base));
+        let expected = (0..MAX_SEND_WINDOW as u32)
+            .map(|offset| p(base.wrapping_add(offset)))
+            .collect::<Vec<_>>();
+        assert_eq!(delivered, expected);
+
+        let mut sender = ReliableState::new();
+        sender.send_seq = base;
+        for _ in 0..MAX_SEND_WINDOW {
+            let seq = sender.next_seq();
+            sender.send_queue.push_back(UnackedMessage {
+                seq,
+                payload: p(seq),
+                last_sent: Instant::now(),
+                send_count: 1,
+            });
+        }
+        let (ack, ack_bits) = receiver.ack_header();
+        sender.process_ack(ack, ack_bits);
+        assert!(sender.send_queue.is_empty());
     }
 
     /// Regression guard for the bitmap-alignment bug. seq=7 arrives first

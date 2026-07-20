@@ -7,8 +7,9 @@
 //!     writes [`TCP_TUNNEL_PREAMBLE`], and both sides switch to tunnel framing
 //!     on the same connection (plaintext, like the normal direct session).
 //!   * **Relay tunnel** — both peers dial the API server's TCP relay, which
-//!     pairs them by token and pipes bytes. Frames are end-to-end encrypted
-//!     with the X25519-derived `CryptoContext`, so the relay sees only
+//!     consumes short-lived tickets, pairs their opaque pair ID, and pipes bytes.
+//!     Frames are end-to-end encrypted
+//!     with a request-scoped X25519+HKDF `CryptoContext`, so the relay sees only
 //!     ciphertext.
 //!
 //! Wire format, repeated per frame:
@@ -223,7 +224,13 @@ impl TcpTunnel {
         std::thread::Builder::new()
             .name("tcp-tunnel-read".into())
             .spawn(move || {
-                run_reader(reader_stream, reader_crypto, leftover, read_tx, reader_closed);
+                run_reader(
+                    reader_stream,
+                    reader_crypto,
+                    leftover,
+                    read_tx,
+                    reader_closed,
+                );
             })
             .map_err(|e| format!("spawn tunnel reader: {e}"))?;
 
@@ -444,7 +451,7 @@ fn run_reader(
             let body_start = consumed + 4;
             let body = &pending[body_start..body_start + len];
             let plain = match &crypto {
-                Some(crypto) => match crypto.decrypt(body) {
+                Some(crypto) => match crypto.decrypt_ordered(body) {
                     Some(pt) => pt,
                     // Authentication failure on a reliable stream means the
                     // stream is corrupt or hostile — tear the tunnel down.
@@ -501,20 +508,20 @@ fn run_reader(
 // Relay handshake (shared by client, server, and the api-server)
 // ---------------------------------------------------------------------------
 
-/// First token on a relay handshake line.
-pub const RELAY_HELLO_MAGIC: &str = "STRELAY1";
-/// Reply the relay sends once both peers of a token are present.
+/// First token on a ticket-authenticated relay handshake line.
+pub const RELAY_HELLO_MAGIC: &str = "STRELAY2";
+/// Reply the relay sends once both tickets for an opaque pair are consumed.
 pub const RELAY_OK: &[u8] = b"OK\n";
 
-/// Build the relay handshake line: `STRELAY1 <role> <base64(token)>\n`.
-pub fn relay_hello_line(role: &str, token: &str) -> String {
-    format!("{RELAY_HELLO_MAGIC} {role} {}\n", base64_encode(token.as_bytes()))
+/// Build the relay handshake line: `STRELAY2 <role> <opaque-ticket>\n`.
+pub fn relay_hello_line(role: &str, ticket: &str) -> String {
+    format!("{RELAY_HELLO_MAGIC} {role} {ticket}\n")
 }
 
-/// Parse a relay handshake line into `(role, token)`. Returns `None` for any
-/// malformed line, unknown role, or oversized/empty token.
-pub fn parse_relay_hello(line: &str, max_token_len: usize) -> Option<(String, String)> {
-    let mut parts = line.trim().split_whitespace();
+/// Parse a relay handshake line into `(role, ticket)`. The ticket is opaque;
+/// only the relay can validate and consume it.
+pub fn parse_relay_hello(line: &str, max_ticket_len: usize) -> Option<(String, String)> {
+    let mut parts = line.split_whitespace();
     if parts.next()? != RELAY_HELLO_MAGIC {
         return None;
     }
@@ -522,11 +529,17 @@ pub fn parse_relay_hello(line: &str, max_token_len: usize) -> Option<(String, St
     if role != "host" && role != "client" {
         return None;
     }
-    let token = String::from_utf8(base64_decode(parts.next()?)?).ok()?;
-    if token.is_empty() || token.len() > max_token_len {
+    let ticket = parts.next()?.to_string();
+    if ticket.is_empty()
+        || ticket.len() > max_ticket_len
+        || parts.next().is_some()
+        || !ticket
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
         return None;
     }
-    Some((role, token))
+    Some((role, ticket))
 }
 
 /// Resolve the relay address: `env_override` (e.g. `ST_RELAY_ADDR`) wins,
@@ -552,13 +565,13 @@ pub fn resolve_relay_addr(
     Some(format!("{host}:{port}"))
 }
 
-/// Dial the relay, send the handshake line for `role`, and block until the
+/// Dial the relay, spend the single-use ticket for `role`, and block until the
 /// relay's `OK` arrives (the partner has paired). Returns the stream
 /// positioned exactly at the start of tunnel traffic.
 pub fn connect_relay(
     addr: &str,
     role: &str,
-    token: &str,
+    ticket: &str,
     pairing_timeout: Duration,
 ) -> Result<TcpStream, String> {
     use std::net::ToSocketAddrs;
@@ -571,7 +584,7 @@ pub fn connect_relay(
         .map_err(|e| format!("connect relay {addr}: {e}"))?;
     let _ = stream.set_nodelay(true);
     stream
-        .write_all(relay_hello_line(role, token).as_bytes())
+        .write_all(relay_hello_line(role, ticket).as_bytes())
         .map_err(|e| format!("relay hello: {e}"))?;
     stream
         .set_read_timeout(Some(pairing_timeout))
@@ -585,61 +598,6 @@ pub fn connect_relay(
     }
     let _ = stream.set_read_timeout(None);
     Ok(stream)
-}
-
-/// Minimal standard base64 (no external dependency in the protocol crate).
-pub fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(CHARS[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let s = s.trim_end_matches('=');
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let a = val(*chunk.first()?)?;
-        let b = val(chunk.get(1).copied()?)?;
-        out.push((a << 2) | (b >> 4));
-        if let Some(&c) = chunk.get(2) {
-            let c = val(c)?;
-            out.push((b << 4) | (c >> 2));
-            if let Some(&d) = chunk.get(3) {
-                let d = val(d)?;
-                out.push((c << 6) | d);
-            }
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -768,12 +726,15 @@ mod tests {
 
     #[test]
     fn relay_hello_roundtrips() {
-        let line = relay_hello_line("client", "my-secret-token");
-        let (role, token) = parse_relay_hello(&line, 256).unwrap();
+        let line = relay_hello_line("client", "opaque_ticket-123");
+        let (role, ticket) = parse_relay_hello(&line, 128).unwrap();
         assert_eq!(role, "client");
-        assert_eq!(token, "my-secret-token");
-        assert!(parse_relay_hello("GARBAGE x y", 256).is_none());
-        assert!(parse_relay_hello(&relay_hello_line("bogus", "t"), 256).is_none());
+        assert_eq!(ticket, "opaque_ticket-123");
+        assert!(parse_relay_hello("GARBAGE x y", 128).is_none());
+        assert!(parse_relay_hello(&relay_hello_line("bogus", "t"), 128).is_none());
+        assert!(parse_relay_hello("STRELAY2 client invalid+ticket", 128).is_none());
+        assert!(parse_relay_hello("STRELAY2 client one trailing", 128).is_none());
+        assert!(parse_relay_hello("STRELAY2 client one\nSTRELAY2 host two", 128).is_none());
     }
 
     #[test]
@@ -787,10 +748,17 @@ mod tests {
             Some("api.example.com:3001")
         );
         assert_eq!(
-            resolve_relay_addr("https://api.example.com", Some(3001), Some("1.2.3.4:9".into()))
-                .as_deref(),
+            resolve_relay_addr(
+                "https://api.example.com",
+                Some(3001),
+                Some("1.2.3.4:9".into())
+            )
+            .as_deref(),
             Some("1.2.3.4:9")
         );
-        assert_eq!(resolve_relay_addr("https://api.example.com", None, None), None);
+        assert_eq!(
+            resolve_relay_addr("https://api.example.com", None, None),
+            None
+        );
     }
 }

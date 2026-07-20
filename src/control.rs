@@ -2,8 +2,12 @@
 //!
 //! Wire format: [type: u8][len: u16 BE][payload: len bytes]
 
+use crate::input::{InputCredential, INPUT_CREDENTIAL_BYTES};
+
 /// Maximum payload size for a control message.
 pub const MAX_CONTROL_PAYLOAD: usize = u16::MAX as usize;
+/// Maximum UTF-8 payload accepted for one committed-text input message.
+pub const MAX_TEXT_INPUT_BYTES: usize = 4096;
 
 /// Control message header size: 1 byte type + 2 bytes length.
 pub const CONTROL_HEADER_SIZE: usize = 3;
@@ -23,8 +27,8 @@ const CLOCK_SYNC_PONG_PAYLOAD_SIZE: usize = 28;
 const TRANSPORT_FEEDBACK_PAYLOAD_SIZE: usize = 44;
 /// Fixed-size payload for the client bitrate-preference handshake (B4).
 const CLIENT_BITRATE_PREFERENCE_PAYLOAD_SIZE: usize = 4;
-/// Fixed-size payload for per-client input session ids.
-const INPUT_SESSION_PAYLOAD_SIZE: usize = 4;
+/// Fixed-size payload for per-client input session ids and UDP credentials.
+const INPUT_SESSION_PAYLOAD_SIZE: usize = 4 + INPUT_CREDENTIAL_BYTES;
 /// Fixed-size payload for controller ownership state.
 const CONTROLLER_STATE_PAYLOAD_SIZE: usize = 1;
 /// Fixed-size payload for advertised input capabilities.
@@ -439,6 +443,8 @@ pub struct InputCapabilities {
     /// legacy cursor plane reports (0,0) on NVIDIA). The client uses this to
     /// avoid re-anchoring a relative-capture cursor to a bogus (0,0) on idle.
     pub cursor_position_reliable: bool,
+    /// Reliable committed Unicode text injection, separate from physical keys.
+    pub text_input: bool,
 }
 
 impl InputCapabilities {
@@ -448,6 +454,7 @@ impl InputCapabilities {
     const SEPARATE_CURSOR_BIT: u8 = 1 << 3;
     const HOVER_CAPTURE_BIT: u8 = 1 << 4;
     const CURSOR_POSITION_RELIABLE_BIT: u8 = 1 << 5;
+    const TEXT_INPUT_BIT: u8 = 1 << 6;
 
     fn serialize(&self) -> [u8; INPUT_CAPABILITIES_PAYLOAD_SIZE] {
         let mut flags = 0u8;
@@ -469,6 +476,9 @@ impl InputCapabilities {
         if self.cursor_position_reliable {
             flags |= Self::CURSOR_POSITION_RELIABLE_BIT;
         }
+        if self.text_input {
+            flags |= Self::TEXT_INPUT_BIT;
+        }
         [flags]
     }
 
@@ -485,6 +495,7 @@ impl InputCapabilities {
             separate_cursor: flags & Self::SEPARATE_CURSOR_BIT != 0,
             hover_capture: flags & Self::HOVER_CAPTURE_BIT != 0,
             cursor_position_reliable: flags & Self::CURSOR_POSITION_RELIABLE_BIT != 0,
+            text_input: flags & Self::TEXT_INPUT_BIT != 0,
         })
     }
 }
@@ -492,11 +503,15 @@ impl InputCapabilities {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InputSession {
     pub client_id: u32,
+    pub credential: InputCredential,
 }
 
 impl InputSession {
     fn serialize(&self) -> [u8; INPUT_SESSION_PAYLOAD_SIZE] {
-        self.client_id.to_be_bytes()
+        let mut buf = [0u8; INPUT_SESSION_PAYLOAD_SIZE];
+        buf[..4].copy_from_slice(&self.client_id.to_be_bytes());
+        buf[4..].copy_from_slice(self.credential.as_bytes());
+        buf
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -506,6 +521,7 @@ impl InputSession {
 
         Some(Self {
             client_id: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            credential: InputCredential::from_bytes(buf[4..].try_into().ok()?),
         })
     }
 }
@@ -793,6 +809,8 @@ pub enum ControlMessage {
     /// after `Authenticate` (B4). Seeds the ABR ceiling so the prober doesn't
     /// overshoot a known-thin link before the first loss.
     ClientBitratePreference(u32),
+    /// Client → server: exact committed IME text, never composing/preedit text.
+    TextInput(String),
 }
 
 impl ControlMessage {
@@ -827,6 +845,7 @@ impl ControlMessage {
     const TYPE_AVAILABLE_OUTPUTS: u8 = 28;
     const TYPE_SELECT_OUTPUT: u8 = 29;
     const TYPE_CLIENT_BITRATE_PREFERENCE: u8 = 30;
+    const TYPE_TEXT_INPUT: u8 = 31;
 
     /// Serialize this message into a byte vector (header + payload).
     pub fn serialize(&self) -> Vec<u8> {
@@ -1118,6 +1137,18 @@ impl ControlMessage {
                     .copy_from_slice(&max_kbps.to_be_bytes());
                 buf
             }
+            ControlMessage::TextInput(text) => {
+                assert!(
+                    text.len() <= MAX_TEXT_INPUT_BYTES && !text.contains('\0'),
+                    "invalid TextInput payload"
+                );
+                let payload = text.as_bytes();
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + payload.len()];
+                buf[0] = Self::TYPE_TEXT_INPUT;
+                buf[1..3].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                buf[CONTROL_HEADER_SIZE..].copy_from_slice(payload);
+                buf
+            }
         }
     }
 
@@ -1314,6 +1345,13 @@ impl ControlMessage {
                 }
                 let max_kbps = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 ControlMessage::ClientBitratePreference(max_kbps)
+            }
+            Self::TYPE_TEXT_INPUT => {
+                if payload.len() > MAX_TEXT_INPUT_BYTES || payload.contains(&0) {
+                    return None;
+                }
+                let text = std::str::from_utf8(payload).ok()?.to_owned();
+                ControlMessage::TextInput(text)
             }
             _ => return None,
         };
@@ -1593,11 +1631,15 @@ mod tests {
 
     #[test]
     fn roundtrip_input_session() {
-        let msg = ControlMessage::InputSession(InputSession { client_id: 77 });
+        let msg = ControlMessage::InputSession(InputSession {
+            client_id: 77,
+            credential: InputCredential::from_bytes([0x5A; INPUT_CREDENTIAL_BYTES]),
+        });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, msg);
         assert_eq!(consumed, buf.len());
+        assert_eq!(buf.len(), CONTROL_HEADER_SIZE + INPUT_SESSION_PAYLOAD_SIZE);
     }
 
     #[test]
@@ -1618,11 +1660,13 @@ mod tests {
             separate_cursor: false,
             hover_capture: true,
             cursor_position_reliable: true,
+            text_input: true,
         });
         let buf = msg.serialize();
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, msg);
         assert_eq!(consumed, buf.len());
+        assert_eq!(buf, vec![16, 0, 1, 0x77]);
     }
 
     #[test]
@@ -1665,6 +1709,50 @@ mod tests {
         let (decoded, consumed) = ControlMessage::deserialize(&buf).unwrap();
         assert_eq!(decoded, msg);
         assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn text_input_has_stable_unicode_wire_format() {
+        let msg = ControlMessage::TextInput("e\u{301} 中文 مرحبا 😀".to_string());
+        let buf = msg.serialize();
+        let payload = "e\u{301} 中文 مرحبا 😀".as_bytes();
+        let mut golden = vec![31, (payload.len() >> 8) as u8, payload.len() as u8];
+        golden.extend_from_slice(payload);
+        assert_eq!(buf, golden);
+        assert_eq!(ControlMessage::deserialize(&buf), Some((msg, buf.len())));
+    }
+
+    #[test]
+    fn text_input_enforces_utf8_nul_and_size_boundaries() {
+        let max = ControlMessage::TextInput("x".repeat(MAX_TEXT_INPUT_BYTES));
+        let encoded = max.serialize();
+        assert_eq!(
+            ControlMessage::deserialize(&encoded),
+            Some((max, encoded.len()))
+        );
+
+        let oversized_len = MAX_TEXT_INPUT_BYTES + 1;
+        let mut oversized = vec![
+            ControlMessage::TYPE_TEXT_INPUT,
+            (oversized_len >> 8) as u8,
+            oversized_len as u8,
+        ];
+        oversized.resize(CONTROL_HEADER_SIZE + oversized_len, b'x');
+        assert!(ControlMessage::deserialize(&oversized).is_none());
+
+        assert!(
+            ControlMessage::deserialize(&[ControlMessage::TYPE_TEXT_INPUT, 0, 2, 0xc3, 0x28])
+                .is_none()
+        );
+        assert!(ControlMessage::deserialize(&[
+            ControlMessage::TYPE_TEXT_INPUT,
+            0,
+            3,
+            b'a',
+            0,
+            b'b'
+        ])
+        .is_none());
     }
 
     #[test]
