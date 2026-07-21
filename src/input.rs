@@ -187,6 +187,9 @@ impl KeyboardKey {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Absolute motion is always meaningful mouse activity and makes this client
+/// the current mouse owner. Periodic state repair should use `MouseButtonsInput`
+/// instead so an idle heartbeat cannot reclaim ownership.
 pub struct MouseAbsoluteInput {
     pub client_id: u32,
     pub x: u16,
@@ -217,6 +220,7 @@ impl MouseAbsoluteInput {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Nonzero motion or a newly pressed button is meaningful mouse activity.
 pub struct MouseRelativeInput {
     pub client_id: u32,
     pub dx: i16,
@@ -247,6 +251,8 @@ impl MouseRelativeInput {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Full mouse-button snapshot. Newly pressed bits are meaningful mouse activity;
+/// unchanged and falling-only snapshots repair state without taking ownership.
 pub struct MouseButtonsInput {
     pub client_id: u32,
     pub buttons: u8,
@@ -271,6 +277,7 @@ impl MouseButtonsInput {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Nonzero wheel motion or a newly pressed button is meaningful mouse activity.
 pub struct MouseWheelInput {
     pub client_id: u32,
     /// High-resolution wheel units. `MOUSE_WHEEL_STEP_UNITS` equals one line/notch.
@@ -303,6 +310,8 @@ impl MouseWheelInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-client full keyboard snapshot. The server ORs all registered clients'
+/// snapshots, so a key remains injected until every client releases it.
 pub struct KeyboardStateInput {
     pub client_id: u32,
     pub pressed: [u8; KEYBOARD_STATE_BYTES],

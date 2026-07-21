@@ -12,9 +12,9 @@ pub const MAX_TEXT_INPUT_BYTES: usize = 4096;
 /// Control message header size: 1 byte type + 2 bytes length.
 pub const CONTROL_HEADER_SIZE: usize = 3;
 
-/// Fixed-size payload for stream configuration: codec/hdr/dims/audio/chroma +
-/// `packet_duration_ms` (E1).
-const STREAM_CONFIG_PAYLOAD_SIZE: usize = 19;
+/// Fixed-size payload for stream configuration: codec/hdr/dims/audio/chroma,
+/// `packet_duration_ms` (E1), and the video media epoch.
+const STREAM_CONFIG_PAYLOAD_SIZE: usize = 27;
 /// Fixed-size payload for client display refresh hints, client UDP receive
 /// port, advertised video codec support, and the HDR-display flag (D2).
 const CLIENT_DISPLAY_INFO_PAYLOAD_SIZE: usize = 9;
@@ -147,6 +147,9 @@ impl VideoChromaSampling {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamConfig {
+    /// Identifies the encoder/media epoch described by this configuration.
+    /// Video from any other epoch must not be submitted to this decoder.
+    pub video_epoch: u64,
     pub codec: VideoCodec,
     pub width: u32,
     pub height: u32,
@@ -176,6 +179,7 @@ impl StreamConfig {
         buf[16] = self.audio_channels;
         buf[17] = self.chroma.to_u8();
         buf[18] = self.packet_duration_ms;
+        buf[19..27].copy_from_slice(&self.video_epoch.to_be_bytes());
         buf
     }
 
@@ -200,6 +204,9 @@ impl StreamConfig {
             audio_channels: buf[16],
             chroma: VideoChromaSampling::from_u8(buf[17])?,
             packet_duration_ms,
+            video_epoch: u64::from_be_bytes([
+                buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26],
+            ]),
         })
     }
 }
@@ -528,10 +535,16 @@ impl InputSession {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ControllerState {
+    /// The active backend cannot inject input. This is the only state that
+    /// prevents a client from sending input.
     #[default]
     Unavailable,
+    /// Input is available and no client currently owns the mouse.
     Available,
+    /// This client supplied the most recent meaningful mouse input.
     OwnedByYou,
+    /// Another client supplied the most recent meaningful mouse input. Input
+    /// remains permitted; the next meaningful mouse action takes ownership.
     OwnedByOther,
 }
 
@@ -751,13 +764,14 @@ pub enum ControlMessage {
     TransportFeedback(TransportFeedback),
     /// Server → client: per-connection input session id.
     InputSession(InputSession),
-    /// Client → server: request exclusive control ownership.
+    /// Client → server: advisory request to become the current mouse owner.
     AcquireControl,
-    /// Client → server: release exclusive control ownership.
+    /// Client → server: advisory release of this client's mouse ownership.
     ReleaseControl,
     /// Client → server: request a fresh video keyframe for decoder recovery.
     RequestKeyframe,
-    /// Server → client: current controller ownership status.
+    /// Server → client: current mouse ownership status. Every state except
+    /// `Unavailable` permits mouse, keyboard, and text input.
     ControllerState(ControllerState),
     /// Server → client: available input features for this session/backend.
     InputCapabilities(InputCapabilities),
@@ -1367,6 +1381,7 @@ mod tests {
     #[test]
     fn roundtrip_stream_config() {
         let msg = ControlMessage::StreamConfig(StreamConfig {
+            video_epoch: 42,
             codec: VideoCodec::Av1,
             width: 2560,
             height: 1440,
@@ -1386,6 +1401,7 @@ mod tests {
     #[test]
     fn stream_config_rejects_short_payload_and_zero_duration_defaults() {
         let mut full = StreamConfig {
+            video_epoch: 42,
             codec: VideoCodec::Hevc,
             width: 1920,
             height: 1080,
@@ -1397,7 +1413,10 @@ mod tests {
             packet_duration_ms: 5,
         };
         // A short payload is rejected outright (no length tolerance).
-        assert!(StreamConfig::deserialize(&full.serialize()[..18]).is_none());
+        assert!(
+            StreamConfig::deserialize(&full.serialize()[..STREAM_CONFIG_PAYLOAD_SIZE - 1])
+                .is_none()
+        );
         // A 0 duration on the wire is an unset sentinel → 20 ms default.
         full.packet_duration_ms = 0;
         let decoded = StreamConfig::deserialize(&full.serialize()).unwrap();

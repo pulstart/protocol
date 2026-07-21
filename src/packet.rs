@@ -2,13 +2,15 @@
 pub const HEADER_SIZE: usize = 7;
 pub const MAX_UDP: usize = 1400;
 pub const MAX_PAYLOAD: usize = MAX_UDP - HEADER_SIZE; // 1393
-/// FrameStart meta: total_packets(2) + capture_ts(8) + send_ts(8) + frame_type(1).
-pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8 + 1;
+/// FrameStart meta: total_packets(2) + capture_ts(8) + send_ts(8) +
+/// video_epoch(8) + frame_type(1).
+pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8 + 8 + 1;
 /// Parity meta: start_seq(2) total_packets(2) chunk_bytes_sum(4) capture_ts(8)
-/// send_ts(8) + RS extension data_shards(2) parity_shards(2) shard_index(2)
-/// shard_len(2) frame_type(1). `parity_shards == 0` is the single-XOR degenerate
-/// case (A1); any positive value selects Reed-Solomon block recovery.
-pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8 + 2 + 2 + 2 + 2 + 1;
+/// send_ts(8) video_epoch(8) + RS extension data_shards(2) parity_shards(2)
+/// shard_index(2) shard_len(2) frame_type(1). `parity_shards == 0` is the
+/// single-XOR degenerate case (A1); any positive value selects Reed-Solomon
+/// block recovery.
+pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8 + 8 + 2 + 2 + 2 + 2 + 1;
 
 /// FEC scheme for a video unit's parity packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -139,6 +141,7 @@ pub fn parse_audio_packet(payload: &[u8]) -> Option<AudioPacketView<'_>> {
 pub struct FrameTimingMeta {
     pub capture_ts_micros: u64,
     pub send_ts_micros: u64,
+    pub video_epoch: u64,
 }
 
 impl FrameTimingMeta {
@@ -152,7 +155,8 @@ impl FrameTimingMeta {
         buf[0..2].copy_from_slice(&total_packets.to_be_bytes());
         buf[2..10].copy_from_slice(&self.capture_ts_micros.to_be_bytes());
         buf[10..18].copy_from_slice(&self.send_ts_micros.to_be_bytes());
-        buf[18] = frame_type;
+        buf[18..26].copy_from_slice(&self.video_epoch.to_be_bytes());
+        buf[26] = frame_type;
     }
 
     /// Deserialize the FrameStart meta. Returns `(total_packets, frame_type,
@@ -169,12 +173,16 @@ impl FrameTimingMeta {
         let send_ts_micros = u64::from_be_bytes([
             buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
         ]);
+        let video_epoch = u64::from_be_bytes([
+            buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25],
+        ]);
         Some((
             total_packets,
-            buf[18],
+            buf[26],
             Self {
                 capture_ts_micros,
                 send_ts_micros,
+                video_epoch,
             },
         ))
     }
@@ -218,11 +226,12 @@ impl FrameParityMeta {
         buf[4..8].copy_from_slice(&self.chunk_bytes_sum.to_be_bytes());
         buf[8..16].copy_from_slice(&self.timing.capture_ts_micros.to_be_bytes());
         buf[16..24].copy_from_slice(&self.timing.send_ts_micros.to_be_bytes());
-        buf[24..26].copy_from_slice(&self.data_shards.to_be_bytes());
-        buf[26..28].copy_from_slice(&self.parity_shards.to_be_bytes());
-        buf[28..30].copy_from_slice(&self.shard_index.to_be_bytes());
-        buf[30..32].copy_from_slice(&self.shard_len.to_be_bytes());
-        buf[32] = self.frame_type;
+        buf[24..32].copy_from_slice(&self.timing.video_epoch.to_be_bytes());
+        buf[32..34].copy_from_slice(&self.data_shards.to_be_bytes());
+        buf[34..36].copy_from_slice(&self.parity_shards.to_be_bytes());
+        buf[36..38].copy_from_slice(&self.shard_index.to_be_bytes());
+        buf[38..40].copy_from_slice(&self.shard_len.to_be_bytes());
+        buf[40] = self.frame_type;
     }
 
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -236,17 +245,20 @@ impl FrameParityMeta {
             send_ts_micros: u64::from_be_bytes([
                 buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
             ]),
+            video_epoch: u64::from_be_bytes([
+                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+            ]),
         };
         Some(Self {
             start_seq: u16::from_be_bytes([buf[0], buf[1]]),
             total_packets: u16::from_be_bytes([buf[2], buf[3]]),
             chunk_bytes_sum: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
             timing,
-            data_shards: u16::from_be_bytes([buf[24], buf[25]]),
-            parity_shards: u16::from_be_bytes([buf[26], buf[27]]),
-            shard_index: u16::from_be_bytes([buf[28], buf[29]]),
-            shard_len: u16::from_be_bytes([buf[30], buf[31]]),
-            frame_type: buf[32],
+            data_shards: u16::from_be_bytes([buf[32], buf[33]]),
+            parity_shards: u16::from_be_bytes([buf[34], buf[35]]),
+            shard_index: u16::from_be_bytes([buf[36], buf[37]]),
+            shard_len: u16::from_be_bytes([buf[38], buf[39]]),
+            frame_type: buf[40],
         })
     }
 }
@@ -358,6 +370,7 @@ mod tests {
         let meta = FrameTimingMeta {
             capture_ts_micros: 123,
             send_ts_micros: 456,
+            video_epoch: 789,
         };
         let mut buf = [0u8; FRAME_START_HEADER_SIZE];
         meta.serialize(7, frame_type::IDR, &mut buf);
@@ -379,6 +392,7 @@ mod tests {
             timing: FrameTimingMeta {
                 capture_ts_micros: 123,
                 send_ts_micros: 456,
+                video_epoch: 789,
             },
             ..Default::default()
         };
@@ -398,6 +412,7 @@ mod tests {
             timing: FrameTimingMeta {
                 capture_ts_micros: 123,
                 send_ts_micros: 456,
+                video_epoch: 789,
             },
             data_shards: 7,
             parity_shards: 3,

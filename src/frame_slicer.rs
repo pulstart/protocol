@@ -131,6 +131,7 @@ impl FrameSlicer {
     /// - 2-byte `total_packets`
     /// - 8-byte server capture timestamp
     /// - 8-byte server send timestamp
+    /// - 8-byte video epoch
     /// - 1-byte frame type
     ///
     /// ...all followed by the NAL data itself.

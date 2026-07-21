@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub struct CompletedFrame {
     pub frame_id: u32,
+    pub video_epoch: u64,
     pub data: Vec<u8>,
     pub timing: FrameTimingMeta,
     /// Frame type from the FrameStart header (see [`crate::packet::frame_type`]).
@@ -264,6 +265,7 @@ impl FrameAssembler {
 
             outcome.completed = Some(CompletedFrame {
                 frame_id: header.frame_id,
+                video_epoch: partial.timing.video_epoch,
                 data,
                 timing: partial.timing,
                 frame_type: partial.frame_type,
@@ -1116,6 +1118,34 @@ mod tests {
     }
 
     #[test]
+    fn parity_from_another_video_epoch_cannot_complete_frame() {
+        let mut slicer = FrameSlicer::new();
+        let original = vec![0x6B; 8_000];
+        let timing = FrameTimingMeta {
+            video_epoch: 7,
+            ..Default::default()
+        };
+        let packets = slicer.slice_with_meta(&original, 13, timing).to_vec();
+        let parity = slicer.parity_packet().unwrap().to_vec();
+        let wrong_epoch_parity = mutate_parity_meta(&parity, |meta| {
+            meta.timing.video_epoch = 8;
+        });
+
+        let mut assembler = FrameAssembler::new();
+        for (index, packet) in packets.iter().enumerate() {
+            if index != 1 {
+                assert!(assembler.ingest(packet).is_none());
+            }
+        }
+        assert!(assembler.ingest(&wrong_epoch_parity).is_none());
+        let completed = assembler
+            .ingest(&parity)
+            .expect("matching parity should recover the frame");
+        assert_eq!(completed.video_epoch, 7);
+        assert_eq!(completed.data, original);
+    }
+
+    #[test]
     fn parity_recovers_missing_first_packet() {
         let mut slicer = FrameSlicer::new();
         let mut assembler = FrameAssembler::new();
@@ -1128,6 +1158,7 @@ mod tests {
                 FrameTimingMeta {
                     capture_ts_micros: 100,
                     send_ts_micros: 200,
+                    video_epoch: 9,
                 },
             )
             .to_vec();
@@ -1146,6 +1177,7 @@ mod tests {
             FrameTimingMeta {
                 capture_ts_micros: 100,
                 send_ts_micros: 200,
+                video_epoch: 9,
             }
         );
     }
@@ -1316,6 +1348,7 @@ mod tests {
         let timing = FrameTimingMeta {
             capture_ts_micros: 11,
             send_ts_micros: 22,
+            video_epoch: 33,
         };
         let (data, parity) = {
             let (d, p) = slicer.slice_with_meta_parts(&original, 99, timing, frame_type::IDR);
@@ -1331,6 +1364,7 @@ mod tests {
         let r = completed.expect("RS should rebuild a lost FrameStart");
         assert_eq!(r.data, original);
         assert_eq!(r.timing, timing);
+        assert_eq!(r.video_epoch, timing.video_epoch);
         // frame_type survives via parity even though FrameStart was lost.
         assert_eq!(r.frame_type, frame_type::IDR);
     }
