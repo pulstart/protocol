@@ -12,6 +12,18 @@ pub const FRAME_START_HEADER_SIZE: usize = 2 + 8 + 8 + 8 + 1;
 /// block recovery.
 pub const FRAME_PARITY_HEADER_SIZE: usize = 2 + 2 + 4 + 8 + 8 + 8 + 2 + 2 + 2 + 2 + 1;
 
+/// Hard cap on the number of packets one encoded video unit may be sliced into.
+///
+/// The receiver enforces this in `FrameAssembler` (an over-cap `total_packets`
+/// fails validation, so the unit can never be reassembled) — which means the
+/// *sender* must enforce the same bound, or it emits units that are silently
+/// undecodable forever. That is not hypothetical: an over-cap IDR would be
+/// dropped by the assembler, the client would ask for another keyframe, and the
+/// encoder would answer with another over-cap IDR — a permanent freeze with no
+/// error on either side. `FrameSlicer` refuses to slice past this so the failure
+/// surfaces as a loud send error instead.
+pub const MAX_UNIT_PACKETS: u16 = 4096;
+
 /// FEC scheme for a video unit's parity packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FecMode {

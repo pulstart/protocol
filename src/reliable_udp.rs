@@ -880,8 +880,22 @@ mod tests {
             .send_to(&encrypted, sender.socket.local_addr().unwrap())
             .unwrap();
 
-        assert!(sender.try_recv().is_none());
-        assert!(sender.control_send.lock().unwrap().is_empty());
+        // Loopback delivery is not synchronous with `send_to`, so poll until the
+        // ack has actually been ingested rather than assuming one `try_recv()`
+        // observes it. A bare ack never yields a payload, so `try_recv()` still
+        // returns `None` on the iteration that drains the pending fragment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(sender.try_recv().is_none());
+            if sender.control_send.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bare ack never drained the pending fragment"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let state = sender.reliable.lock().unwrap();
         assert_eq!(state.send_queue.len(), MAX_SEND_WINDOW);
         assert_eq!(state.send_queue.back().unwrap().seq, MAX_SEND_WINDOW as u32);

@@ -174,12 +174,23 @@ impl FrameSlicer {
         let chunk_payload_cap = self.chunk_payload_cap();
         // First packet reserves metadata for packet count + frame timings.
         let first_payload_cap = chunk_payload_cap - FRAME_START_HEADER_SIZE;
-        let total_packets = if nal_data.len() <= first_payload_cap {
-            1u16
+        // Count in `usize`: the packet count must be range-checked against
+        // MAX_UNIT_PACKETS *before* it is narrowed, or a huge unit silently
+        // wraps the u16 and produces a bogus `total_packets` on the wire.
+        let packet_count = if nal_data.len() <= first_payload_cap {
+            1usize
         } else {
-            let remaining = nal_data.len() - first_payload_cap;
-            1 + remaining.div_ceil(chunk_payload_cap) as u16
+            1 + (nal_data.len() - first_payload_cap).div_ceil(chunk_payload_cap)
         };
+        if packet_count > crate::packet::MAX_UNIT_PACKETS as usize {
+            // The receiver would reject this unit outright, so emitting it would
+            // burn bandwidth on something undecodable. Produce nothing and let
+            // the caller report a send error — a visible failure beats a stream
+            // that freezes with no diagnostic.
+            self.packets.clear();
+            return;
+        }
+        let total_packets = packet_count as u16;
 
         // Reuse packet vec — grow if needed, shrink if too many
         let count = total_packets as usize;
@@ -516,5 +527,30 @@ mod tests {
             assert_eq!(meta.shard_index as usize, i);
             assert_eq!(meta.frame_type, frame_type::IDR);
         }
+    }
+
+    #[test]
+    fn oversized_unit_emits_nothing_instead_of_an_unassemblable_frame() {
+        // Regression guard: an access unit needing more than MAX_UNIT_PACKETS
+        // packets is rejected by the receiver's assembler. If the slicer emitted
+        // it anyway the stream froze permanently (client asks for a keyframe →
+        // server answers with another over-cap IDR → forever). It must produce
+        // no packets so the sender reports a real error.
+        let mut slicer = FrameSlicer::new();
+        let cap = crate::packet::MAX_UNIT_PACKETS as usize;
+
+        // Just under the cap still slices normally.
+        let ok = vec![0x11u8; cap * 1_000];
+        let packets = slicer.slice(&ok, 1).to_vec();
+        assert!(!packets.is_empty());
+        assert!(packets.len() <= cap);
+
+        // Comfortably over the cap produces nothing at all.
+        let too_big = vec![0x22u8; cap * 4_000];
+        assert!(slicer.slice(&too_big, 2).is_empty());
+        assert!(slicer.parity_packets().is_empty());
+
+        // And the slicer stays usable for the next (normal) unit.
+        assert!(!slicer.slice(&[1, 2, 3], 3).is_empty());
     }
 }

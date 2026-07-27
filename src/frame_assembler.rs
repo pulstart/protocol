@@ -66,8 +66,9 @@ struct PartialFrame {
 
 /// Maximum number of pending incomplete frames before forcing cleanup.
 const MAX_PENDING_FRAMES: usize = 30;
-/// Hard resource bounds for one encoded video unit.
-const MAX_FRAME_PACKETS: u16 = 4096;
+/// Hard resource bounds for one encoded video unit. Shared with the slicer so
+/// the sender can never emit a unit this side would refuse to reassemble.
+const MAX_FRAME_PACKETS: u16 = crate::packet::MAX_UNIT_PACKETS;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// The assembler is transport-agnostic: UDP normally uses 1400-byte packets,
 /// while the reliable TCP tunnel deliberately slices at 16 KiB.
