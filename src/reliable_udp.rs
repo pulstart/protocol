@@ -535,6 +535,16 @@ impl PunchedSocket {
             return Vec::new();
         }
 
+        // The peer can still be punching if our initial ACK burst was lost.
+        // Continue answering authenticated probes after handing the socket to
+        // the session, otherwise that peer times out while we wait for auth.
+        // Do not answer ACKs: doing so would create an endless ACK exchange.
+        if plaintext == b"STPUNCH" {
+            let ack = self.crypto.encrypt(b"STPUNCH_ACK");
+            let _ = self.socket.send_to(&ack, self.peer);
+            return Vec::new();
+        }
+
         let channel = plaintext[0];
         match channel {
             CHANNEL_MEDIA => {
@@ -758,6 +768,72 @@ mod tests {
                 last_sent: Instant::now(),
                 send_count: 1,
             });
+        }
+    }
+
+    #[test]
+    fn punch_recovers_when_initial_ack_burst_is_lost() {
+        let host_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_udp.local_addr().unwrap();
+        let client_addr = client_udp.local_addr().unwrap();
+        let host_crypto = Arc::new(CryptoContext::new(TEST_KEY, true));
+        let client_crypto = Arc::new(CryptoContext::new(TEST_KEY, false));
+        client_udp
+            .send_to(&client_crypto.encrypt(b"STPUNCH"), host_addr)
+            .unwrap();
+        let peer = crate::tunnel::hole_punch(
+            &host_udp,
+            &[client_addr],
+            &host_crypto,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        // Drop the host's first probe and all three ACKs, simulating loss of
+        // that whole burst on the return path. The host has already handed
+        // its socket to the session while the client still needs confirmation.
+        client_udp
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut dropped = [0u8; 256];
+        for _ in 0..4 {
+            client_udp.recv_from(&mut dropped).unwrap();
+        }
+        let host = PunchedSocket::new(host_udp, peer, host_crypto);
+        host.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            crate::tunnel::hole_punch(
+                &client_udp,
+                &[host_addr],
+                &client_crypto,
+                Duration::from_secs(2),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !client.is_finished() && Instant::now() < deadline {
+            assert!(host.try_recv().is_none());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.join().unwrap().unwrap(), host_addr);
+    }
+
+    #[test]
+    fn established_punch_does_not_echo_acks_or_accept_other_keys() {
+        let (client, host) = punched_pair();
+        for packet in [
+            client.crypto.encrypt(b"STPUNCH_ACK"),
+            CryptoContext::new([0x99; 32], false).encrypt(b"STPUNCH"),
+        ] {
+            client
+                .socket
+                .send_to(&packet, host.socket.local_addr().unwrap())
+                .unwrap();
+            assert!(host.try_recv().is_none());
+            let mut buf = [0u8; 256];
+            assert_eq!(
+                client.socket.recv_from(&mut buf).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
     }
 
