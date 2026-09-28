@@ -224,6 +224,9 @@ impl TcpTunnel {
         std::thread::Builder::new()
             .name("tcp-tunnel-read".into())
             .spawn(move || {
+                crate::thread_priority::promote_current_thread(
+                    crate::thread_priority::ThreadRole::Network,
+                );
                 run_reader(
                     reader_stream,
                     reader_crypto,
@@ -242,6 +245,9 @@ impl TcpTunnel {
         std::thread::Builder::new()
             .name("tcp-tunnel-write".into())
             .spawn(move || {
+                crate::thread_priority::promote_current_thread(
+                    crate::thread_priority::ThreadRole::Network,
+                );
                 run_writer(writer_stream, write_rx, writer_closed, writer_pending);
             })
             .map_err(|e| format!("spawn tunnel writer: {e}"))?;

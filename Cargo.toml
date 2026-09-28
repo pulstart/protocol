@@ -6,6 +6,8 @@ edition = "2021"
 [features]
 default = []
 tunnel = ["x25519-dalek", "chacha20poly1305", "hkdf", "sha2", "rand"]
+# RealtimeKit fallback for thread elevation; the binary supplies the zbus runtime feature.
+rtkit = ["dep:zbus"]
 
 [dependencies]
 libc = "0.2"
@@ -15,3 +17,6 @@ hkdf = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
 reed-solomon-simd = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["blocking-api"], optional = true }

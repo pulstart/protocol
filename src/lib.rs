@@ -10,6 +10,7 @@ pub mod portmap;
 pub mod reliable_udp;
 #[cfg(feature = "tunnel")]
 pub mod tcp_tunnel;
+pub mod thread_priority;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
 
