@@ -852,6 +852,21 @@ fn candidate_string(ip: std::net::IpAddr, port: u16) -> String {
     SocketAddr::new(ip, port).to_string()
 }
 
+/// STUN is re-swept every few seconds to keep the NAT mapping fresh; only a
+/// changed answer is worth a log line.
+fn log_stun_change(observed: &[SocketAddr]) {
+    static LOGGED: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+    let mut sorted = observed.to_vec();
+    sorted.sort();
+    let mut logged = LOGGED.lock().unwrap();
+    if *logged != sorted {
+        for addr in &sorted {
+            eprintln!("[stun] Discovered public address: {addr}");
+        }
+        *logged = sorted;
+    }
+}
+
 /// Like `gather_local_candidates`, but also performs STUN discovery on the given socket.
 ///
 /// Candidate ordering:
@@ -888,10 +903,10 @@ pub fn gather_candidates_with_stun(port: u16, stun_socket: Option<&UdpSocket>) -
     let mut stun_obs: Vec<SocketAddr> = Vec::new();
     if let Some(sock) = stun_socket {
         stun_obs = stun_discover_all(sock);
+        log_stun_change(&stun_obs);
         for addr in &stun_obs {
             let c = addr.to_string();
             if !candidates.contains(&c) {
-                eprintln!("[stun] Discovered public address: {c}");
                 candidates.push(c);
             }
         }

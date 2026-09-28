@@ -5,7 +5,9 @@ use crate::packet::{
 
 /// FEC parameters for the slicer. For [`FecMode::Rs`], `fec_pct` and `min_parity`
 /// pick the parity-shard count per multi-packet unit:
-/// `parity = max(min_parity, ceil(data_shards * fec_pct / 100))`.
+/// `parity = max(min_parity, ceil(data_shards * fec_pct / 100))`. IDR/recovery
+/// units get at least [`KEYFRAME_MIN_PARITY`] and 1/[`KEYFRAME_PARITY_DIV`] of
+/// their packets: a lost keyframe costs a re-request round plus another keyframe.
 #[derive(Debug, Clone, Copy)]
 pub struct FecConfig {
     pub mode: FecMode,
@@ -22,6 +24,9 @@ impl Default for FecConfig {
         }
     }
 }
+
+const KEYFRAME_MIN_PARITY: usize = 4;
+const KEYFRAME_PARITY_DIV: usize = 10;
 
 pub struct FrameSlicer {
     seq: u16,
@@ -304,7 +309,7 @@ impl FrameSlicer {
             }
             FecMode::Rs => {
                 let data_shards = total_packets as usize;
-                let parity_shards = self.rs_parity_count(total_packets);
+                let parity_shards = self.rs_parity_count(total_packets, frame_type);
                 let recovery = match reed_solomon_simd::encode(
                     data_shards,
                     parity_shards,
@@ -354,10 +359,19 @@ impl FrameSlicer {
         }
     }
 
-    fn rs_parity_count(&self, total_packets: u16) -> usize {
+    fn rs_parity_count(&self, total_packets: u16, frame_type: u8) -> usize {
         let data = total_packets as usize;
         let by_pct = (data * self.fec.fec_pct as usize).div_ceil(100);
-        by_pct.max(self.fec.min_parity as usize).max(1).min(data)
+        let floor = if frame_type == frame_type::P {
+            0
+        } else {
+            KEYFRAME_MIN_PARITY.max(data.div_ceil(KEYFRAME_PARITY_DIV))
+        };
+        by_pct
+            .max(self.fec.min_parity as usize)
+            .max(floor)
+            .max(1)
+            .min(data)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -510,7 +524,7 @@ mod tests {
         let data = vec![0x9C; 12_000];
         let (packets, parity) = {
             let (p, q) =
-                slicer.slice_with_meta_parts(&data, 5, FrameTimingMeta::default(), frame_type::IDR);
+                slicer.slice_with_meta_parts(&data, 5, FrameTimingMeta::default(), frame_type::P);
             (p.to_vec(), q.to_vec())
         };
         assert!(packets.len() > 1);
@@ -525,7 +539,36 @@ mod tests {
             assert_eq!(meta.data_shards as usize, packets.len());
             assert_eq!(meta.parity_shards as usize, parity.len());
             assert_eq!(meta.shard_index as usize, i);
-            assert_eq!(meta.frame_type, frame_type::IDR);
+            assert_eq!(meta.frame_type, frame_type::P);
+        }
+    }
+
+    #[test]
+    fn keyframes_get_a_parity_floor_on_a_clean_link() {
+        let fec = FecConfig {
+            mode: FecMode::Rs,
+            fec_pct: 0,
+            min_parity: 1,
+        };
+        let data = vec![0x5A; 400 * 1_300];
+        for (ty, expect_floor) in [
+            (frame_type::P, false),
+            (frame_type::IDR, true),
+            (frame_type::RECOVERY, true),
+        ] {
+            let mut slicer = FrameSlicer::with_config(1_400, fec);
+            let (packets, parity) = {
+                let (p, q) = slicer.slice_with_meta_parts(&data, 1, FrameTimingMeta::default(), ty);
+                (p.len(), q.len())
+            };
+            if expect_floor {
+                assert!(
+                    parity >= packets.div_ceil(10),
+                    "{ty}: {parity} parity for {packets} packets"
+                );
+            } else {
+                assert_eq!(parity, 1);
+            }
         }
     }
 

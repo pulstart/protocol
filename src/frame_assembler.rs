@@ -833,7 +833,7 @@ mod tests {
         );
         let payload = vec![0x5Au8; 6_000];
         let (data, parity) =
-            slicer.slice_with_meta_parts(&payload, 1, FrameTimingMeta::default(), frame_type::IDR);
+            slicer.slice_with_meta_parts(&payload, 1, FrameTimingMeta::default(), frame_type::P);
         let data = data.to_vec();
         let parity = parity.to_vec();
         assert!(data.len() > 1, "payload must be multi-packet");
